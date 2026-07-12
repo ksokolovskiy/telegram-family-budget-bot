@@ -1,0 +1,36 @@
+[project]
+name = "telegram-family-budget-bot"
+version = "0.1.0"
+description = "AI-powered Telegram family budget bot"
+requires-python = ">=3.11"
+dependencies = [
+  "aiogram>=3.10,<4",
+  "alembic>=1.13,<2",
+  "asyncpg>=0.29,<1",
+  "openai>=1.35,<2",
+  "pydantic-settings>=2.3,<3",
+  "python-dotenv>=1.0,<2",
+  "sqlalchemy[asyncio]>=2.0,<3",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8,<9",
+  "pytest-asyncio>=0.23,<1",
+  "ruff>=0.5,<1",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["app*"]

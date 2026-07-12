@@ -1,0 +1,32 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: budget-bot-postgres
+    environment:
+      POSTGRES_DB: budget_bot
+      POSTGRES_USER: budget
+      POSTGRES_PASSWORD: budget
+    ports:
+      - "5434:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U budget -d budget_bot"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  bot:
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://budget:budget@postgres:5432/budget_bot
+    command: sh -c "alembic upgrade head && python -m app.main"
+    restart: unless-stopped
+
+volumes:
+  postgres_data:

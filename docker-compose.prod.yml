@@ -1,0 +1,16 @@
+services:
+  bot:
+    image: ${APP_IMAGE:-telegram-family-budget-bot:latest}
+    build: .
+    container_name: telegram-family-budget-bot
+    env_file:
+      - .env
+    command: sh -c "alembic upgrade head && python -m app.main"
+    restart: unless-stopped
+    networks:
+      - central
+
+networks:
+  central:
+    name: ${DOCKER_NETWORK:-central}
+    external: true
