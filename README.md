@@ -15,7 +15,7 @@ The local compose file starts a PostgreSQL container and runs Alembic migrations
 
 ## Production on ksokol2
 
-Production deploy is handled by `.github/workflows/deploy.yml` over SSH. The server is expected to have Docker, Docker Compose, and a PostgreSQL container named `central-postgres` attached to the Docker network used by the app.
+Production deploy is handled by the manual GitHub Actions workflow `.github/workflows/deploy.yml` over SSH. The server is expected to have Docker, Docker Compose, and a PostgreSQL container named `central-postgres` attached to the Docker network used by the app.
 
 Required GitHub secrets:
 
@@ -33,7 +33,7 @@ Required GitHub secrets:
 - `DOCKER_NETWORK` (Docker network shared with `central-postgres`, for example `central`)
 - `DEPLOY_PATH` (for example `/opt/telegram-family-budget-bot`)
 
-The workflow creates the database if it does not exist, writes `.env` on the server from secrets, and runs:
+After the secrets are configured, run the `Deploy to ksokol2` workflow manually. The workflow creates the database if it does not exist, writes `.env` on the server from secrets, and runs:
 
 ```bash
 docker compose -f docker-compose.prod.yml up -d --build
