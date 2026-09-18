@@ -11,25 +11,11 @@ from app.models import Budget, Category, Family, Transaction, User
 from app.rich import esc, link
 
 MONTH_NAMES_RU = ("январь", "февраль", "март", "апрель", "май", "июнь", "июль", "август", "сентябрь", "октябрь", "ноябрь", "декабрь")
-# Ordinary spaces collapse inside a rich HTML table; non-breaking spaces make
-# the report's hierarchy visible on Telegram clients. They are placed outside
-# the link because Telegram trims leading whitespace inside a link label.
-_CATEGORY_INDENT = "\u00a0\u00a0\u00a0"
-_OPERATION_INDENT = "\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0"
 
 
 def money(value: Decimal | int | float | None, currency: str = "ILS") -> str:
     symbols = {"RUB": "₽", "USD": "$", "EUR": "€", "ILS": "₪"}
     return f"{Decimal(value or 0):,.0f}".replace(",", " ") + " " + symbols.get(currency, currency)
-
-
-def report_tree_indent(level: str) -> str:
-    """Visible whitespace placed before, rather than inside, a rich link."""
-    if level == "category":
-        return _CATEGORY_INDENT
-    if level == "operation":
-        return _OPERATION_INDENT
-    return ""
 
 
 def period_bounds(kind: str, anchor: str | None = None, timezone_name: str = "UTC") -> tuple[datetime, datetime, str, list[str]]:
@@ -219,7 +205,7 @@ async def build_report_html(
         delta_total = plan_total - fact_total
         type_link = link(f"r:{token}:e:{tx_type}", ("▾ " if open_type == tx_type else "▸ ") + title)
         prior_total = prior_income if tx_type == "income" else prior_expense
-        table_parts.append(f"<tr><td><b>{type_link}</b></td><td>{esc(money(plan_total, currency))}</td><td>{esc(money(fact_total, currency))}</td><td>{esc(money(delta_total, currency))}</td><td>{esc(period_change(fact_total, prior_total))}</td><td></td></tr>")
+        table_parts.append(f"<tr><td colspan=\"3\"><b>{type_link}</b></td><td>{esc(money(plan_total, currency))}</td><td>{esc(money(fact_total, currency))}</td><td>{esc(money(delta_total, currency))}</td><td>{esc(period_change(fact_total, prior_total))}</td><td></td></tr>")
         if open_type != tx_type:
             continue
         categories = sorted((row for row in rows if row["type"] == tx_type), key=row_key, reverse=descending)
@@ -231,7 +217,7 @@ async def build_report_html(
                 ("▾ " if expanded else "▸ ") + str(row["name"]),
             )
             prior_fact = prior_facts.get((category_id, tx_type), Decimal("0"))
-            table_parts.append(f"<tr><td>{report_tree_indent('category')}{category_link}</td><td>{esc(money(row['plan'], currency))}</td><td>{esc(money(row['fact'], currency))}</td><td>{esc(money(row['delta'], currency))}</td><td>{esc(period_change(Decimal(row['fact']), prior_fact))}</td><td></td></tr>")
+            table_parts.append(f"<tr><td>&nbsp;</td><td colspan=\"2\">{category_link}</td><td>{esc(money(row['plan'], currency))}</td><td>{esc(money(row['fact'], currency))}</td><td>{esc(money(row['delta'], currency))}</td><td>{esc(period_change(Decimal(row['fact']), prior_fact))}</td><td></td></tr>")
             if not expanded:
                 continue
             operations = transactions_by_category.get(category_id, [])
@@ -241,9 +227,9 @@ async def build_report_html(
                 tools = ""
                 if can_edit:
                     tools = link(f"txe:{tx.id}:amount", "✎") + " " + link(f"txe:{tx.id}:delete", "🗑")
-                table_parts.append(f"<tr><td>{report_tree_indent('operation')}{link(f'txopen:{tx.id}', operation_name)}</td><td>—</td><td>{esc(money(tx.amount, currency))}</td><td>—</td><td>—</td><td>{tools}</td></tr>")
+                table_parts.append(f"<tr><td>&nbsp;</td><td>&nbsp;</td><td>{link(f'txopen:{tx.id}', operation_name)}</td><td>—</td><td>{esc(money(tx.amount, currency))}</td><td>—</td><td>—</td><td>{tools}</td></tr>")
 
     current_anchor = datetime.now(ZoneInfo(family.timezone if family else "UTC")).strftime("%Y-%m")
     next_link = link(f"r:{token}:p:next", "→") if shift_anchor(anchor, kind, 1) <= current_anchor else ""
     period_nav = f"{link(f'r:{token}:p:prev', '←')} {link(f'r:{token}:v', period_title(kind, anchor))} {next_link}"
-    return f'<h3>📊 Бюджет · {period_nav} · {link(f"r:{token}:x", "↻")}</h3><table><tr><th>{header("name", "Статья / операция")}</th><th>{header("plan", "План")}</th><th>{header("fact", "Факт")}</th><th>{header("delta", "Остаток")}</th><th>К прошлому</th><th></th></tr>{"".join(table_parts)}</table><p><b>Доступно:</b> {esc(money(income_fact - expense_fact, currency))}</p>'
+    return f'<h3>📊 Бюджет · {period_nav} · {link(f"r:{token}:x", "↻")}</h3><table><tr><th colspan="3">{header("name", "Статья / операция")}</th><th>{header("plan", "План")}</th><th>{header("fact", "Факт")}</th><th>{header("delta", "Остаток")}</th><th>К прошлому</th><th></th></tr>{"".join(table_parts)}</table><p><b>Доступно:</b> {esc(money(income_fact - expense_fact, currency))}</p>'

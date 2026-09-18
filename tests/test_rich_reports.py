@@ -1,6 +1,7 @@
 from datetime import datetime, timezone
+from pathlib import Path
 
-from app.reports import period_bounds, report_tree_indent, shift_anchor
+from app.reports import build_report_html, period_bounds, shift_anchor
 from app.rich import link
 from app.models import TransactionDraft
 from app.charts import ReportChartService
@@ -41,9 +42,8 @@ def test_chart_is_a_real_png_attachment_source():
     assert image.startswith(b"\x89PNG\r\n\x1a\n")
 
 
-def test_report_tree_levels_have_visible_nonbreaking_indentation():
-    category = report_tree_indent("category")
-    operation = report_tree_indent("operation")
-    assert category.strip() == ""
-    assert operation.strip() == ""
-    assert len(operation) > len(category)
+def test_report_uses_table_columns_for_hierarchy():
+    source = Path(build_report_html.__code__.co_filename).read_text()
+    assert 'colspan="3"' in source
+    assert source.count("&nbsp;") >= 3
+    assert "colspan" in source
