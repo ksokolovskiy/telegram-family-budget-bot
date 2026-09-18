@@ -11,11 +11,24 @@ from app.models import Budget, Category, Family, Transaction, User
 from app.rich import esc, link
 
 MONTH_NAMES_RU = ("январь", "февраль", "март", "апрель", "май", "июнь", "июль", "август", "сентябрь", "октябрь", "ноябрь", "декабрь")
+# Ordinary spaces collapse inside a rich HTML table; non-breaking spaces make
+# the report's hierarchy visible on Telegram clients.
+_CATEGORY_INDENT = "\u00a0\u00a0"
+_OPERATION_INDENT = "\u00a0\u00a0\u00a0\u00a0\u00a0"
 
 
 def money(value: Decimal | int | float | None, currency: str = "ILS") -> str:
     symbols = {"RUB": "₽", "USD": "$", "EUR": "€", "ILS": "₪"}
     return f"{Decimal(value or 0):,.0f}".replace(",", " ") + " " + symbols.get(currency, currency)
+
+
+def report_tree_label(level: str, label: str) -> str:
+    """Return a visibly indented label for the report's first column."""
+    if level == "category":
+        return _CATEGORY_INDENT + "↳ " + label
+    if level == "operation":
+        return _OPERATION_INDENT + "↳ " + label
+    return label
 
 
 def period_bounds(kind: str, anchor: str | None = None, timezone_name: str = "UTC") -> tuple[datetime, datetime, str, list[str]]:
@@ -212,7 +225,10 @@ async def build_report_html(
         for row in categories:
             category_id = int(row["id"])
             expanded = open_category_id == category_id
-            category_link = link(f"r:{token}:c:{category_id}", ("　▾ " if expanded else "　▸ ") + str(row["name"]))
+            category_link = link(
+                f"r:{token}:c:{category_id}",
+                report_tree_label("category", ("▾ " if expanded else "▸ ") + str(row["name"])),
+            )
             prior_fact = prior_facts.get((category_id, tx_type), Decimal("0"))
             table_parts.append(f"<tr><td>{category_link}</td><td>{esc(money(row['plan'], currency))}</td><td>{esc(money(row['fact'], currency))}</td><td>{esc(money(row['delta'], currency))}</td><td>{esc(period_change(Decimal(row['fact']), prior_fact))}</td><td></td></tr>")
             if not expanded:
@@ -220,7 +236,7 @@ async def build_report_html(
             operations = transactions_by_category.get(category_id, [])
             operations.sort(key=lambda tx: (str(tx.comment or "").lower() if sort == "name" else (tx.amount if sort in {"fact", "plan", "delta"} else tx.date)), reverse=descending)
             for tx in operations:
-                operation_name = "　　　" + tx.date.astimezone(zone).strftime("%d.%m %H:%M")
+                operation_name = report_tree_label("operation", tx.date.astimezone(zone).strftime("%d.%m %H:%M"))
                 tools = ""
                 if can_edit:
                     tools = link(f"txe:{tx.id}:amount", "✎") + " " + link(f"txe:{tx.id}:delete", "🗑")

@@ -24,13 +24,13 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import BotCommand, CallbackQuery, Message
 from openai import AsyncOpenAI
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from app.ai import AIParser, AIUnavailableError, ParsedTransaction, reconcile_receipt_totals
 from app.config import settings
 from app.db import SessionLocal
 from app.models import Account, Category, Family, FamilyInvite, InteractiveScreen, RecurringTransaction, Transaction, TransactionDraft, Transfer, User
-from app.reports import build_report_html, money, report_rows, shift_anchor
+from app.reports import build_report_html, money, period_bounds, period_title, report_rows, shift_anchor
 from app.exchange import convert_amount
 from app.receipts import ENABLE_RECEIPT_URLS, ReceiptError, extract_pdf_text, fetch_receipt_url, is_http_url, render_pdf_pages
 from app.repositories import (
@@ -1327,22 +1327,28 @@ async def budget(message: Message, bot: Bot) -> None:
 
 async def budget_html(session, user: User) -> str:
     """Render the same budget table for initial display and inline refresh."""
-    items = await list_categories(session, user.family_id, "expense")
+    items = await list_categories(session, user.family_id)
     family = await session.get(Family, user.family_id)
+    target_period = datetime.now(ZoneInfo(family.timezone if family else "UTC")).strftime("%Y-%m")
     _, report, _, _, _ = await report_rows(
-        session, user.family_id, "month", datetime.now(timezone.utc).strftime("%Y-%m")
+        session, user.family_id, "month", target_period
     )
-    values = {item["id"]: item for item in report if item["type"] == "expense"}
+    values = {item["id"]: item for item in report}
     rows = "".join(
         "<tr>"
         f"<td>{link(f'budget:{item.id}', item.name) if can_manage_family(user) else esc(item.name)}</td>"
+        f"<td>{'Доход' if item.type == 'income' else 'Расход'}</td>"
         f"<td>{esc(money(values.get(item.id, {}).get('plan', 0), family.currency if family else 'ILS'))}</td>"
         f"<td>{esc(money(values.get(item.id, {}).get('fact', 0), family.currency if family else 'ILS'))}</td>"
         f"<td>{esc(money(values.get(item.id, {}).get('delta', 0), family.currency if family else 'ILS'))}</td></tr>"
         for item in items
-    ) or '<tr><td colspan="4">Нет активных расходных категорий.</td></tr>'
-    hint = "Нажмите категорию, чтобы изменить лимит." if can_manage_family(user) else "Лимиты изменяет owner или editor."
-    return f"<h3>Лимиты · текущий месяц</h3><table><tr><th>Категория</th><th>План</th><th>Факт</th><th>Остаток</th></tr>{rows}</table><p>{hint}</p>"
+    ) or '<tr><td colspan="5">Нет активных категорий.</td></tr>'
+    if can_manage_family(user):
+        prior_period = shift_anchor(target_period, "month", -1)
+        hint = f"Нажмите категорию, чтобы изменить лимит. · {link('budget:from_fact', 'Взять факт ' + period_title('month', prior_period))}"
+    else:
+        hint = "Лимиты изменяет owner или editor."
+    return f"<h3>Лимиты · {esc(period_title('month', target_period))}</h3><table><tr><th>Категория</th><th>Тип</th><th>План</th><th>Факт</th><th>Остаток</th></tr>{rows}</table><p>{hint}</p>"
 
 
 @router.callback_query(F.data.startswith("r:"))
@@ -1586,6 +1592,32 @@ async def join_code(message: Message, state: FSMContext, bot: Bot) -> None:
 @router.callback_query(F.data.startswith("budget:"))
 async def budget_pick(callback: CallbackQuery, state: FSMContext, bot: Bot) -> None:
     raw_action = callback.data.split(":")[1]
+    if raw_action == "from_fact":
+        async with SessionLocal() as session, session.begin():
+            user = await session.get(User, callback.from_user.id)
+            if not can_manage_family(user):
+                await callback.answer("Недостаточно прав.", show_alert=True); return
+            family = await session.get(Family, user.family_id)
+            target = datetime.now(ZoneInfo(family.timezone if family else "UTC")).strftime("%Y-%m")
+            previous = shift_anchor(target, "month", -1)
+            start, end, _, _ = period_bounds("month", previous, family.timezone if family else "UTC")
+            facts = dict(
+                await session.execute(
+                    select(Transaction.category_id, func.coalesce(func.sum(Transaction.amount), 0))
+                    .where(
+                        Transaction.family_id == user.family_id, Transaction.deleted_at.is_(None),
+                        Transaction.date >= start, Transaction.date < end,
+                    )
+                    .group_by(Transaction.category_id)
+                )
+            )
+            categories = await list_categories(session, user.family_id)
+            for category in categories:
+                await upsert_budget(session, user.family_id, category.id, Decimal(facts.get(category.id, 0)), period=target)
+            html = await budget_html(session, user)
+        await rich.edit(bot, callback.message.chat.id, callback.message.message_id, html)
+        await callback.answer("Лимиты обновлены по факту прошлого месяца.")
+        return
     if raw_action == "copy":
         async with SessionLocal() as session, session.begin():
             user = await session.get(User, callback.from_user.id)
@@ -1605,7 +1637,7 @@ async def budget_pick(callback: CallbackQuery, state: FSMContext, bot: Bot) -> N
     async with SessionLocal() as session:
         user = await session.get(User, callback.from_user.id)
         category = await session.get(Category, int(category_id))
-    if not can_manage_family(user) or not category or category.family_id != user.family_id or category.type != "expense" or not category.is_active:
+    if not can_manage_family(user) or not category or category.family_id != user.family_id or not category.is_active:
         await callback.answer("Категория недоступна", show_alert=True)
         return
     await state.update_data(category_id=category.id, budget_chat_id=callback.message.chat.id, budget_message_id=callback.message.message_id)

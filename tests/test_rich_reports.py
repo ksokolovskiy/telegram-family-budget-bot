@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 
-from app.reports import period_bounds, shift_anchor
+from app.reports import period_bounds, report_tree_label, shift_anchor
 from app.rich import link
 from app.models import TransactionDraft
 from app.charts import ReportChartService
@@ -39,3 +39,11 @@ def test_chart_is_a_real_png_attachment_source():
     image = ReportChartService().png([("Продукты", 1200), ("Транспорт", 500)])
     assert image is not None
     assert image.startswith(b"\x89PNG\r\n\x1a\n")
+
+
+def test_report_tree_levels_have_visible_nonbreaking_indentation():
+    category = report_tree_label("category", "Продукты")
+    operation = report_tree_label("operation", "18.09 10:00")
+    assert category.endswith("↳ Продукты")
+    assert operation.endswith("↳ 18.09 10:00")
+    assert len(operation) > len(category)
