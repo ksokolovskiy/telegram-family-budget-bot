@@ -1571,6 +1571,8 @@ def draft_html(
     source_amount: Decimal | None = None,
     source_currency: str | None = None,
 ) -> str:
+    if items and not receipt_totals_match(items, amount, receipt_discount):
+        return receipt_balance_error_html(token, items, amount, receipt_discount, currency, can_retry_receipt)
     direction = "Доход" if tx_type == "income" else "Расход"
     item_table = ""
     if items:
@@ -1622,6 +1624,31 @@ def draft_html(
         f"{category_row}"
         f"<tr><td>Комментарий</td><td>{link(f'tx:{token}:comment', comment or '—')}</td></tr></table>"
         f"{receipt_discount_line}{item_table}<p>{link(f'tx:{token}:retry_receipt', 'Распознать заново') if can_retry_receipt else ''} {link(f'tx:{token}:save', save_label)} · {link(f'tx:{token}:cancel', 'Отмена')}</p>"
+    )
+
+
+def receipt_totals_match(items, amount: Decimal, receipt_discount: Decimal = Decimal("0")) -> bool:
+    """Receipt drafts are only actionable when their line totals match exactly."""
+    item_total = sum((Decimal(str(item["amount"] if isinstance(item, dict) else item.amount)) for item in items), Decimal("0")) - receipt_discount
+    return abs(item_total - amount) <= Decimal("0.01")
+
+
+def receipt_balance_error_html(
+    token: str,
+    items,
+    amount: Decimal,
+    receipt_discount: Decimal,
+    currency: str,
+    can_retry_receipt: bool,
+) -> str:
+    item_total = sum((Decimal(str(item["amount"] if isinstance(item, dict) else item.amount)) for item in items), Decimal("0")) - receipt_discount
+    difference = amount - item_total
+    retry = link(f"tx:{token}:retry_receipt", "Распознать заново") if can_retry_receipt else "Загрузите чек повторно"
+    return (
+        "<h3>Не удалось сверить чек</h3>"
+        f"<p>Позиции: {esc(money(item_total, currency))}; итог: {esc(money(amount, currency))}; "
+        f"разница: {esc(money(difference, currency))}.</p>"
+        f"<p>{retry} · {link(f'tx:{token}:cancel', 'Отмена')}</p>"
     )
 
 
@@ -1740,13 +1767,12 @@ async def transaction_action(callback: CallbackQuery, state: FSMContext, bot: Bo
         if action == "save":
             items = draft.items or []
             notification_family_id, notification_actor_id = draft.family_id, draft.user_id
-            item_total = sum((Decimal(str(item["amount"])) for item in items), Decimal("0")) - draft.receipt_discount
-            if items and abs(item_total - draft.amount) > Decimal("0.01"):
+            if items and not receipt_totals_match(items, draft.amount, draft.receipt_discount):
                 notification_family_id, notification_actor_id = None, None
-                difference = draft.amount - item_total
-                html = (
-                    f"<p>Позиции чека дают {esc(money(item_total))}, а итог чека — {esc(money(draft.amount))}. "
-                    f"Разница: {esc(money(difference))}. Черновик не сохранён: исправьте позиции или выберите «Распознать заново».</p>"
+                family = await session.get(Family, draft.family_id)
+                html = receipt_balance_error_html(
+                    token, items, draft.amount, draft.receipt_discount,
+                    family.currency if family else "ILS", bool(draft.receipt_file_id),
                 )
             elif items:
                 groups = receipt_category_groups(items, draft.receipt_discount)

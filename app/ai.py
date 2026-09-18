@@ -112,15 +112,39 @@ def receipt_response_format(categories: list[str]) -> dict[str, Any]:
 
 
 def reconcile_receipt_totals(parsed: ParsedTransaction | None) -> ParsedTransaction | None:
-    """Normalise a receipt-wide discount already included in line amounts."""
-    if not parsed or not parsed.items or parsed.receipt_discount <= 0:
+    """Make small OCR rounding omissions explicit without changing the receipt total.
+
+    A receipt's printed total is authoritative.  Vision models occasionally
+    omit a tiny line (most often an IKEA rounding/adjustment line) even though
+    they read the total correctly.  Do not reject an otherwise usable receipt:
+    preserve the discrepancy as a visible, separately named line in the
+    largest category.  Larger discrepancies still require a re-scan/manual
+    correction, because they are likely a missing product rather than rounding.
+    """
+    if not parsed or not parsed.items:
         return parsed
     items_total = sum((item.amount for item in parsed.items), Decimal("0"))
     # Some vision responses provide a receipt discount while their line amounts
     # already add up to the final total.  Counting it again would deduct it twice.
-    if abs(items_total - parsed.amount) <= Decimal("0.01"):
+    if parsed.receipt_discount > 0 and abs(items_total - parsed.amount) <= Decimal("0.01"):
         return parsed.model_copy(update={"receipt_discount": Decimal("0")})
-    return parsed
+
+    residual = (parsed.amount - (items_total - parsed.receipt_discount)).quantize(Decimal("0.01"))
+    if residual == 0 or abs(residual) > Decimal("2.00"):
+        return parsed
+
+    # When the rows exceed the total, the residual is a receipt-wide discount
+    # not represented by the model.  When they fall short, represent the
+    # printed adjustment openly, instead of silently changing a product price.
+    if residual < 0:
+        return parsed.model_copy(update={"receipt_discount": parsed.receipt_discount - residual})
+    largest = max(parsed.items, key=lambda item: item.amount)
+    adjustment = ReceiptItem(
+        name="Корректировка по итогу чека",
+        amount=residual,
+        category=largest.category,
+    )
+    return parsed.model_copy(update={"items": [*parsed.items, adjustment]})
 
 
 class AIParser:
