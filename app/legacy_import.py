@@ -31,7 +31,9 @@ TZ = ZoneInfo("Asia/Jerusalem")
 # (destination type, destination category). These are the mappings agreed with
 # the family before this import; names not present in the DB are created.
 MAPPING = {
-    "Аренда квартиры": ("expense", "Аренда"),
+    # This is rental income; the similarly named "Аренда" sheet below is the
+    # family's own rent expense and deliberately has the opposite direction.
+    "Аренда квартиры": ("income", "Аренда"),
     "Корзина": ("income", "Корзина"),
     "Проценты по депозиту": ("income", "Проценты по депозиту"),
     "Прочее": ("expense", "Другое"),
