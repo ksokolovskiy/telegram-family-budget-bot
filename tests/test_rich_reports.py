@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 
-from app.reports import period_bounds, report_tree_label, shift_anchor
+from app.reports import period_bounds, report_tree_indent, shift_anchor
 from app.rich import link
 from app.models import TransactionDraft
 from app.charts import ReportChartService
@@ -42,8 +42,8 @@ def test_chart_is_a_real_png_attachment_source():
 
 
 def test_report_tree_levels_have_visible_nonbreaking_indentation():
-    category = report_tree_label("category", "Продукты")
-    operation = report_tree_label("operation", "18.09 10:00")
-    assert category.endswith("↳ Продукты")
-    assert operation.endswith("↳ 18.09 10:00")
+    category = report_tree_indent("category")
+    operation = report_tree_indent("operation")
+    assert category.strip() == ""
+    assert operation.strip() == ""
     assert len(operation) > len(category)
