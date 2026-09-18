@@ -125,6 +125,11 @@ class AdvancedFlow(StatesGroup):
     waiting_value = State()
 
 
+class SplitFlow(StatesGroup):
+    waiting_amount = State()
+    waiting_category = State()
+
+
 class RecurringFlow(StatesGroup):
     waiting_amount = State()
     waiting_first_run = State()
@@ -643,6 +648,110 @@ async def split_command(message: Message, bot: Bot) -> None:
     await rich.send(bot, message.chat.id, "<h3>Разбить платёж</h3><p>Создаёт несколько связанных операций с разными категориями.</p>" + action)
 
 
+def split_summary_html(lines: list[dict[str, str]], currency: str) -> str:
+    """Compact review screen for a split; all adding happens one value at a time."""
+    rows = "".join(
+        f"<tr><td>{esc(line['category'])}</td><td>{esc(money(Decimal(line['amount']), currency))}</td></tr>"
+        for line in lines
+    )
+    total = sum((Decimal(line["amount"]) for line in lines), Decimal("0"))
+    return (
+        "<h3>Разбить расход</h3>"
+        f"<table><tr><th>Категория</th><th>Сумма</th></tr>{rows}"
+        f"<tr><th>Итого</th><th>{esc(money(total, currency))}</th></tr></table>"
+        f"<p>{link('split:add', '＋ Добавить позицию')}"
+        + (f" · {link('split:save', '✓ Записать')}" if len(lines) >= 2 else "")
+        + f" · {link('split:cancel', 'Отмена')}</p>"
+    )
+
+
+async def split_currency(user: User) -> str:
+    async with SessionLocal() as session:
+        family = await session.get(Family, user.family_id)
+    return family.currency if family else "ILS"
+
+
+@router.message(SplitFlow.waiting_amount)
+async def split_amount(message: Message, state: FSMContext, bot: Bot) -> None:
+    try:
+        amount = Decimal((message.text or "").strip().replace(",", "."))
+        if amount <= 0:
+            raise ValueError
+    except (InvalidOperation, ValueError):
+        await rich.send(bot, message.chat.id, "<p>Введите положительную сумму, например <code>120</code>.</p>")
+        return
+    user = await ensure_user(message)
+    if not user.family_id or not can_manage_family(user):
+        await state.clear()
+        return
+    async with SessionLocal() as session:
+        categories = await list_categories(session, user.family_id, "expense")
+    if not categories:
+        await rich.send(bot, message.chat.id, "<p>Сначала создайте расходную категорию.</p>")
+        return
+    await state.update_data(split_pending_amount=str(amount))
+    await state.set_state(SplitFlow.waiting_category)
+    choices = " · ".join(link(f"splitcat:{category.id}", category.name) for category in categories)
+    await rich.send(bot, message.chat.id, f"<h3>Выберите категорию</h3><p>Сумма: {esc(money(amount, await split_currency(user)))}</p><p>{choices}</p><p>{link('split:cancel', 'Отмена')}</p>")
+
+
+@router.callback_query(F.data.startswith("splitcat:"))
+async def split_category(callback: CallbackQuery, state: FSMContext, bot: Bot) -> None:
+    raw_id = callback.data.split(":", 1)[1]
+    data = await state.get_data()
+    if not raw_id.isdigit() or not data.get("split_pending_amount"):
+        await callback.answer("Введите сумму позиции заново.", show_alert=True)
+        return
+    user = await ensure_callback_user(callback)
+    async with SessionLocal() as session:
+        category = await session.get(Category, int(raw_id))
+    if not user.family_id or not category or category.family_id != user.family_id or category.type != "expense":
+        await callback.answer("Категория недоступна.", show_alert=True)
+        return
+    lines = list(data.get("split_lines", []))
+    lines.append({"category_id": str(category.id), "category": category.name, "amount": data["split_pending_amount"]})
+    await state.update_data(split_lines=lines, split_pending_amount=None)
+    await state.set_state(SplitFlow.waiting_amount)
+    await rich.edit(bot, callback.message.chat.id, callback.message.message_id, split_summary_html(lines, await split_currency(user)))
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("split:"))
+async def split_action(callback: CallbackQuery, state: FSMContext, bot: Bot) -> None:
+    action = callback.data.split(":", 1)[1]
+    if action not in {"add", "save", "cancel"}:
+        await callback.answer("Некорректное действие.", show_alert=True)
+        return
+    if action == "cancel":
+        await state.clear()
+        await rich.edit(bot, callback.message.chat.id, callback.message.message_id, "<p>Разбиение отменено.</p>")
+        await callback.answer()
+        return
+    user = await ensure_callback_user(callback)
+    data = await state.get_data()
+    lines = list(data.get("split_lines", []))
+    if action == "add":
+        await state.set_state(SplitFlow.waiting_amount)
+        await rich.edit(bot, callback.message.chat.id, callback.message.message_id, "<h3>Добавить позицию</h3><p>Введите её сумму.</p><p>" + link("split:cancel", "Отмена") + "</p>")
+        await callback.answer()
+        return
+    if not user.family_id or not can_manage_family(user) or len(lines) < 2:
+        await callback.answer("Добавьте хотя бы две позиции.", show_alert=True)
+        return
+    async with SessionLocal() as session, session.begin():
+        resolved = []
+        for line in lines:
+            category = await session.get(Category, int(line["category_id"]))
+            if not category or category.family_id != user.family_id or category.type != "expense":
+                await callback.answer("Одна из категорий больше недоступна.", show_alert=True)
+                return
+            resolved.append((category, Decimal(line["amount"]), None))
+        group, transactions = await create_split_payment(session, user.family_id, user.id, "expense", resolved)
+    await state.clear()
+    await rich.edit(bot, callback.message.chat.id, callback.message.message_id, f"<p>Создано операций: {len(transactions)}.</p>")
+    await callback.answer()
+
+
 @router.callback_query(F.data.startswith("rcopen:"))
 async def recurring_detail(callback: CallbackQuery, bot: Bot) -> None:
     raw_id = callback.data.split(":", 1)[1]
@@ -763,10 +872,24 @@ async def advanced_action(callback: CallbackQuery, state: FSMContext, bot: Bot) 
         )
         await callback.answer()
         return
+    if mode == "split":
+        user = await ensure_callback_user(callback)
+        if not user.family_id or not can_manage_family(user):
+            await callback.answer("Роль viewer может только просматривать данные.", show_alert=True)
+            return
+        await state.clear()
+        await state.update_data(split_lines=[])
+        await state.set_state(SplitFlow.waiting_amount)
+        await rich.edit(
+            bot, callback.message.chat.id, callback.message.message_id,
+            "<h3>Разбить расход</h3><p>Введите сумму первой позиции.</p>"
+            f"<p>{link('split:cancel', 'Отмена')}</p>",
+        )
+        await callback.answer()
+        return
     prompts = {
         "account": "Введите <code>Название; Валюта</code>, например <code>Наличные; RUB</code>.",
         "transfer": "Введите <code>Счёт-откуда; Счёт-куда; Сумма; комментарий</code>.",
-        "split": "Введите позиции через <code>;</code>: <code>Категория=сумма; Категория=сумма</code>.",
     }
     if mode not in prompts:
         await callback.answer("Некорректное действие", show_alert=True); return
