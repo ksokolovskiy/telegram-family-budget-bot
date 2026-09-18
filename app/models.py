@@ -133,6 +133,23 @@ class Transaction(Base):
     receipt_purged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
+class LegacyImportRow(Base):
+    """Idempotency ledger for every row read from a legacy export."""
+
+    __tablename__ = "legacy_import_rows"
+    __table_args__ = (UniqueConstraint("family_id", "source_key", name="uq_legacy_import_rows_family_source"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    family_id: Mapped[int] = mapped_column(ForeignKey("families.id", ondelete="CASCADE"), nullable=False, index=True)
+    source_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    source_file: Mapped[str] = mapped_column(String(255), nullable=False)
+    source_sheet: Mapped[str] = mapped_column(String(120), nullable=False)
+    source_row: Mapped[int] = mapped_column(nullable=False)
+    status: Mapped[str] = mapped_column(String(40), nullable=False)
+    transaction_id: Mapped[int | None] = mapped_column(ForeignKey("transactions.id", ondelete="SET NULL"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
 class TransactionAudit(Base):
     """Append-only audit trail for manual updates and soft deletion."""
 
