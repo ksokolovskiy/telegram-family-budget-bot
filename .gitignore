@@ -13,3 +13,4 @@ htmlcov/
 .vscode/
 .DS_Store
 *.egg-info/
+logs/

@@ -10,6 +10,17 @@ services:
     networks:
       - central
 
+  worker:
+    image: ${APP_IMAGE:-telegram-family-budget-bot:latest}
+    build: .
+    container_name: telegram-family-budget-worker
+    env_file:
+      - .env
+    command: python -m app.worker
+    restart: unless-stopped
+    networks:
+      - central
+
 networks:
   central:
     name: ${DOCKER_NETWORK:-central}

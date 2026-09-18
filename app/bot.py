@@ -26,6 +26,7 @@ from app.repositories import (
     upsert_budget,
 )
 from app.reports import build_report
+from app.settings_store import get_family_ai_settings
 
 logger = logging.getLogger(__name__)
 router = Router()
@@ -201,7 +202,8 @@ async def handle_media(message: Message, bot: Bot) -> None:
     image_bytes = data.read()
     async with SessionLocal() as session:
         categories = [cat.name for cat in await list_categories(session, user.family_id)]
-    parsed = await ai_parser.parse_image(image_bytes, mime_type, categories)
+        runtime = await get_family_ai_settings(session, user.family_id)
+    parsed = await ai_parser.parse_image(image_bytes, mime_type, categories, runtime)
     if not parsed:
         await message.answer("Не удалось автоматически распознать трату. Введите сумму вручную или выберите категорию")
         return
@@ -216,7 +218,8 @@ async def handle_text(message: Message) -> None:
         return
     async with SessionLocal() as session:
         categories = [cat.name for cat in await list_categories(session, user.family_id)]
-    parsed = await ai_parser.parse_text(message.text or "", categories)
+        runtime = await get_family_ai_settings(session, user.family_id)
+    parsed = await ai_parser.parse_text(message.text or "", categories, runtime)
     if not parsed:
         await message.answer("Не удалось автоматически распознать трату. Введите сумму вручную или выберите категорию")
         return

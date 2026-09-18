@@ -4,7 +4,7 @@ AI-powered Telegram bot for quick family budget tracking: text input, receipt im
 
 ## Local run
 
-1. Copy `.env.example` to `.env` and set `BOT_TOKEN` and `OPENAI_API_KEY`.
+1. Create a private `.env` (it is ignored by Git) with `BOT_TOKEN`, `OWNER_TELEGRAM_ID` and `DATABASE_URL`.
 2. Start the stack:
 
 ```bash
@@ -12,6 +12,18 @@ docker compose up --build
 ```
 
 The local compose file starts a PostgreSQL container and runs Alembic migrations before the bot starts.
+
+After the first start, the configured owner opens `/settings` in the bot and
+sets the OpenAI API key, model, application environment and log level. These
+are persisted in PostgreSQL and take effect without a restart; the API key is
+always masked in the interface and is never logged. On its next save, the API
+key is encrypted at rest with Fernet; its key is derived by HKDF from the
+deployment's `BOT_TOKEN`, so no additional `.env` secret is introduced.
+**Rotate the bot token only through a controlled procedure:** while the old
+token is still available, read/decrypt the setting and save it again after
+switching to the new token; otherwise the stored OpenAI key cannot be recovered
+and must be entered again by the owner. The private bootstrap configuration is
+needed before the process can reach the database that stores the other settings.
 
 ## Production on ksokol2
 
@@ -24,16 +36,12 @@ Required GitHub secrets:
 - `KSOKOL2_SSH_KEY`
 - `KSOKOL2_PORT` (optional, defaults to `22` in workflow expressions)
 - `BOT_TOKEN`
-- `OPENAI_API_KEY`
-- `OPENAI_MODEL` (optional, defaults to `gpt-4o-mini`)
-- `POSTGRES_CONTAINER` (defaults conceptually to `central-postgres`)
-- `POSTGRES_DB`
-- `POSTGRES_USER`
-- `POSTGRES_PASSWORD`
+- `OWNER_TELEGRAM_ID`
+- `DATABASE_URL`
 - `DOCKER_NETWORK` (Docker network shared with `central-postgres`, for example `central`)
 - `DEPLOY_PATH` (for example `/opt/telegram-family-budget-bot`)
 
-After the secrets are configured, run the `Deploy to ksokol2` workflow manually. The workflow creates the database if it does not exist, writes `.env` on the server from secrets, and runs:
+After the secrets are configured, run the `Deploy to ksokol2` workflow manually. It writes the private bootstrap `.env` on the server from secrets and runs:
 
 ```bash
 docker compose -f docker-compose.prod.yml up -d --build

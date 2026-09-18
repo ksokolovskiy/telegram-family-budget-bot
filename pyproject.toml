@@ -4,11 +4,15 @@ version = "0.1.0"
 description = "AI-powered Telegram family budget bot"
 requires-python = ">=3.11"
 dependencies = [
-  "aiogram>=3.10,<4",
+  "aiohttp>=3.10,<4",
+  "aiogram>=3.31,<4",
   "alembic>=1.13,<2",
   "asyncpg>=0.29,<1",
+  "cryptography>=43,<46",
   "openai>=1.35,<2",
   "pydantic-settings>=2.3,<3",
+  "playwright>=1.52,<2",
+  "PyMuPDF>=1.24,<2",
   "python-dotenv>=1.0,<2",
   "sqlalchemy[asyncio]>=2.0,<3",
 ]

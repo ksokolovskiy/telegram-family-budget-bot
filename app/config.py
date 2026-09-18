@@ -7,11 +7,11 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
     bot_token: str = ""
-    openai_api_key: str | None = None
-    openai_model: str = "gpt-4o-mini"
-    database_url: str = "postgresql+asyncpg://budget:budget@postgres:5432/budget_bot"
-    log_level: str = "INFO"
-    app_env: str = "local"
+    # These three values are required before the database can be reached and
+    # intentionally remain deployment configuration. All product settings are
+    # stored in the app_settings table and changed through /settings.
+    owner_telegram_id: int | None = None
+    database_url: str = ""
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 

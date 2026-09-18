@@ -37,30 +37,12 @@ jobs:
           set -euo pipefail
           cd "${{ secrets.DEPLOY_PATH }}"
 
-          POSTGRES_CONTAINER="${{ secrets.POSTGRES_CONTAINER || 'central-postgres' }}"
-          POSTGRES_DB="${{ secrets.POSTGRES_DB }}"
-          POSTGRES_USER="${{ secrets.POSTGRES_USER }}"
-          POSTGRES_PASSWORD="${{ secrets.POSTGRES_PASSWORD }}"
           DOCKER_NETWORK="${{ secrets.DOCKER_NETWORK }}"
-
-          docker network inspect "$DOCKER_NETWORK" >/dev/null
-          docker inspect "$POSTGRES_CONTAINER" >/dev/null
-          if ! docker inspect -f '{{json .NetworkSettings.Networks}}' "$POSTGRES_CONTAINER" | grep -q "\"$DOCKER_NETWORK\""; then
-            docker network connect "$DOCKER_NETWORK" "$POSTGRES_CONTAINER"
-          fi
-
-          docker exec -e PGPASSWORD="$POSTGRES_PASSWORD" "$POSTGRES_CONTAINER" \
-            psql -U "$POSTGRES_USER" -d postgres -tc "SELECT 1 FROM pg_database WHERE datname = '$POSTGRES_DB'" | grep -q 1 \
-            || docker exec -e PGPASSWORD="$POSTGRES_PASSWORD" "$POSTGRES_CONTAINER" \
-              createdb -U "$POSTGRES_USER" "$POSTGRES_DB"
 
           cat > .env <<ENV
           BOT_TOKEN=${{ secrets.BOT_TOKEN }}
-          OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}
-          OPENAI_MODEL=${{ secrets.OPENAI_MODEL || 'gpt-4o-mini' }}
-          DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@${POSTGRES_CONTAINER}:5432/${POSTGRES_DB}
-          LOG_LEVEL=INFO
-          APP_ENV=production
+          OWNER_TELEGRAM_ID=${{ secrets.OWNER_TELEGRAM_ID }}
+          DATABASE_URL=${{ secrets.DATABASE_URL }}
           DOCKER_NETWORK=${DOCKER_NETWORK}
           ENV
 
