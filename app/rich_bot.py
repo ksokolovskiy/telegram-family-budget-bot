@@ -58,6 +58,44 @@ ai_parser = AIParser()
 rich = RichMessageService()
 
 
+# A currency may be attached to the amount (``10usd``) or separated by a
+# space. Ordinary Russian category names cannot match this ASCII ISO pattern.
+INLINE_PAYMENT_RE = re.compile(
+    r"^\s*(?P<sign>\+?)(?P<amount>\d+(?:[.,]\d{1,2})?)"
+    r"(?:\s*(?P<currency>[A-Za-z]{3})(?=\s|$))?"
+    r"(?:\s+(?P<tail>.*?))?\s*$"
+)
+
+
+def inline_payment_parts(text: str) -> tuple[str, Decimal | None, str | None, str | None]:
+    """Return parser-ready text, explicit amount, ISO code and user tail."""
+    match = INLINE_PAYMENT_RE.fullmatch(text)
+    if not match:
+        return text, None, None, None
+    raw_amount = match.group("amount")
+    try:
+        amount = Decimal(raw_amount.replace(",", "."))
+    except InvalidOperation:
+        return text, None, None, None
+    tail = (match.group("tail") or "").strip()
+    normalized = f"{match.group('sign')}{raw_amount}" + (f" {tail}" if tail else "")
+    return normalized, amount, (match.group("currency") or "").upper() or None, tail
+
+
+def normalize_text_comment(parsed: ParsedTransaction, amount: Decimal, tail: str | None) -> ParsedTransaction:
+    """A bare category is not a comment; neither is the entered amount."""
+    normalized_tail = (tail or "").strip()
+    comment = (parsed.comment or "").strip()
+    amount_text = format(amount, "f")
+    if (
+        not normalized_tail
+        or normalized_tail.casefold() == parsed.category.strip().casefold()
+        or comment in {str(amount), amount_text, amount_text.replace(".", ",")}
+    ):
+        return parsed.model_copy(update={"comment": None})
+    return parsed
+
+
 @dataclass
 class ReceiptAlbum:
     user_id: int
@@ -110,6 +148,12 @@ class SettingsFlow(StatesGroup):
 
 
 class TransactionEditFlow(StatesGroup):
+    waiting_value = State()
+
+
+class TransactionCurrencyFlow(StatesGroup):
+    """A typed ISO code is accepted only as a reply to its picker prompt."""
+
     waiting_value = State()
 
 
@@ -1683,6 +1727,7 @@ async def ask_confirmation(
     receipt_mime_type: str | None = None,
     choose_category: bool = False,
     user: User | None = None,
+    source_currency: str | None = None,
 ) -> None:
     # Callback messages belong to the bot; callers then pass the person who
     # pressed the rich link so no bot-as-viewer record is used.
@@ -1696,7 +1741,18 @@ async def ask_confirmation(
         family = await session.get(Family, user.family_id)
         if values.get("receipt_storage") == "do_not_retain" or not family or family.receipt_retention_days == 0:
             receipt_file_id, receipt_mime_type = None, None
-        session.add(TransactionDraft(token=token, user_id=user.id, family_id=user.family_id, chat_id=message.chat.id, message_id=None, amount=parsed.amount, source_amount=parsed.amount, source_currency=family.currency if family else "ILS", exchange_rate=Decimal("1"), exchange_rate_date=datetime.now(timezone.utc).date(), exchange_rate_source="family_currency", type=parsed.type, category=parsed.category, comment=parsed.comment, receipt_file_id=receipt_file_id, receipt_mime_type=receipt_mime_type, items=[item.model_dump(mode="json") for item in parsed.items] or None, receipt_discount=parsed.receipt_discount, expires_at=expiry()))
+        family_currency = family.currency if family else "ILS"
+        document_currency = (source_currency or family_currency).upper()
+        source_amount, amount = parsed.amount, parsed.amount
+        rate, rate_date, rate_source = Decimal("1"), datetime.now(timezone.utc).date(), "family_currency"
+        if document_currency != family_currency:
+            try:
+                amount, rate, rate_date = await convert_amount(source_amount, document_currency, family_currency, session=session)
+            except ReceiptError as error:
+                await rich.send(bot, message.chat.id, f"<p>{esc(error)}</p>")
+                return
+            rate_source = "Bank of Israel"
+        session.add(TransactionDraft(token=token, user_id=user.id, family_id=user.family_id, chat_id=message.chat.id, message_id=None, amount=amount, source_amount=source_amount, source_currency=document_currency, exchange_rate=rate, exchange_rate_date=rate_date, exchange_rate_source=rate_source, type=parsed.type, category=parsed.category, comment=parsed.comment, receipt_file_id=receipt_file_id, receipt_mime_type=receipt_mime_type, items=[item.model_dump(mode="json") for item in parsed.items] or None, receipt_discount=parsed.receipt_discount, expires_at=expiry()))
     if choose_category:
         async with SessionLocal() as session:
             categories = await list_categories(session, user.family_id, parsed.type)
@@ -1704,7 +1760,7 @@ async def ask_confirmation(
             link(f"txc:{token}:{category.id}", category.name) for category in categories
         ) + "</p>"
     else:
-        html = draft_html(token, parsed.amount, parsed.type, parsed.category, parsed.comment, parsed.items, family.currency if family else "ILS", receipt_discount=parsed.receipt_discount, can_retry_receipt=bool(receipt_file_id))
+        html = draft_html(token, amount, parsed.type, parsed.category, parsed.comment, parsed.items, family_currency, receipt_discount=parsed.receipt_discount, can_retry_receipt=bool(receipt_file_id), source_amount=source_amount, source_currency=document_currency)
     result = await rich.send(bot, message.chat.id, html)
     async with SessionLocal() as session, session.begin():
         draft = await session.scalar(select(TransactionDraft).where(TransactionDraft.token == token))
@@ -1771,9 +1827,12 @@ def draft_html(
         if receipt_discount > 0
         else ""
     )
+    amount_text = money(amount, currency)
+    if source_amount is not None and source_currency and source_currency != currency:
+        amount_text = f"{money(source_amount, source_currency)} → {amount_text}"
     return (
         "<h3>Проверить операцию</h3><table><tr><th>Поле</th><th>Значение</th></tr>"
-        f"<tr><td>Сумма</td><td>{link(f'tx:{token}:amount', money(amount, currency))}</td></tr>"
+        f"<tr><td>Сумма</td><td>{link(f'tx:{token}:amount', amount_text)}</td></tr>"
         f"<tr><td>Валюта документа</td><td>{link(f'tx:{token}:currency', source_currency or currency)}</td></tr>"
         f"<tr><td>Тип</td><td>{link(f'tx:{token}:type', direction)}</td></tr>"
         f"{category_row}"
@@ -1951,9 +2010,9 @@ async def transaction_action(callback: CallbackQuery, state: FSMContext, bot: Bo
         elif action == "currency":
             family = await session.get(Family, draft.family_id)
             choices = []
-            for code in dict.fromkeys([family.currency if family else "ILS", "ILS", "USD", "EUR", "GBP", "RUB"]):
+            for code in dict.fromkeys([family.currency if family else "ILS", "ILS", "USD", "EUR", "GBP", "RUB", "KZT"]):
                 choices.append(link(f"txcur:{token}:{code}", code))
-            html = "<h3>Валюта документа</h3><p>Выберите валюту суммы на чеке.</p><p>" + " · ".join(choices) + f"</p><p>{link(f'tx:{token}:overview', '← К черновику')}</p>"
+            html = "<h3>Валюта документа</h3><p>Выберите валюту суммы.</p><p>" + " · ".join(choices) + f"</p><p>Другой код: ответьте на это сообщение тремя латинскими буквами, например <code>AUD</code>.</p><p>{link(f'tx:{token}:overview', '← К черновику')}</p>"
         elif action == "type":
             html = "<h3>Выберите тип</h3><p>" + link(f"txt:{token}:income", "Доход") + " · " + link(f"txt:{token}:expense", "Расход") + "</p>"
         elif action == "items":
@@ -1974,6 +2033,12 @@ async def transaction_action(callback: CallbackQuery, state: FSMContext, bot: Bo
             return
         else: await session.delete(draft); html = "<p>Отменено.</p>"
     await rich.edit(bot, callback.message.chat.id, callback.message.message_id, html)
+    if action == "currency":
+        await state.update_data(
+            transaction_currency_token=token,
+            transaction_currency_prompt_id=callback.message.message_id,
+        )
+        await state.set_state(TransactionCurrencyFlow.waiting_value)
     if action == "save" and notification_family_id is not None and notification_actor_id is not None:
         await notify_other_family_members(bot, notification_family_id, notification_actor_id, notification_entries)
         await send_current_month_report(
@@ -1986,7 +2051,7 @@ async def transaction_action(callback: CallbackQuery, state: FSMContext, bot: Bo
 
 
 @router.callback_query(F.data.startswith("txcur:"))
-async def transaction_currency(callback: CallbackQuery, bot: Bot) -> None:
+async def transaction_currency(callback: CallbackQuery, state: FSMContext, bot: Bot) -> None:
     parts = callback.data.split(":")
     if len(parts) != 3 or len(parts[2]) != 3 or not parts[2].isalpha():
         await callback.answer("Некорректная валюта", show_alert=True)
@@ -2000,7 +2065,7 @@ async def transaction_currency(callback: CallbackQuery, bot: Bot) -> None:
         family = await session.get(Family, draft.family_id)
         source_amount = draft.source_amount or draft.amount
         try:
-            amount, rate, rate_date = await convert_amount(source_amount, source_currency, family.currency if family else "ILS")
+            amount, rate, rate_date = await convert_amount(source_amount, source_currency, family.currency if family else "ILS", session=session)
         except ReceiptError as error:
             await callback.answer(str(error), show_alert=True)
             return
@@ -2009,6 +2074,8 @@ async def transaction_currency(callback: CallbackQuery, bot: Bot) -> None:
         draft.revision += 1
         html = await draft_html_for_family(session, draft)
     await rich.edit(bot, callback.message.chat.id, callback.message.message_id, html)
+    # Selecting one of the offered codes concludes the same currency flow.
+    await state.clear()
     await callback.answer()
 
 
@@ -2101,6 +2168,46 @@ async def transaction_type(callback: CallbackQuery, bot: Bot) -> None:
         html = await draft_html_for_family(session, draft)
     await rich.edit(bot, callback.message.chat.id, callback.message.message_id, html)
     await callback.answer()
+
+
+@router.message(TransactionCurrencyFlow.waiting_value)
+async def typed_transaction_currency(message: Message, state: FSMContext, bot: Bot) -> None:
+    """Accept an arbitrary ISO code only as an explicit reply to the picker."""
+    data = await state.get_data()
+    prompt_id = data.get("transaction_currency_prompt_id")
+    token = data.get("transaction_currency_token")
+    if not token or not prompt_id or not message.reply_to_message or message.reply_to_message.message_id != prompt_id:
+        await rich.send(bot, message.chat.id, "<p>Ответьте трёхбуквенным кодом именно на сообщение выбора валюты.</p>")
+        return
+    source_currency = (message.text or "").strip().upper()
+    if not re.fullmatch(r"[A-Z]{3}", source_currency):
+        await rich.send(bot, message.chat.id, "<p>Введите трёхбуквенный ISO-код, например <code>AUD</code>.</p>")
+        return
+    async with SessionLocal() as session, session.begin():
+        draft = await session.scalar(select(TransactionDraft).where(TransactionDraft.token == token).with_for_update())
+        if (
+            not draft or draft.status != "active" or draft.user_id != message.from_user.id
+            or draft.chat_id != message.chat.id or draft.message_id != prompt_id
+            or draft.expires_at <= datetime.now(timezone.utc)
+        ):
+            await state.clear()
+            await rich.send(bot, message.chat.id, "<p>Черновик устарел.</p>")
+            return
+        family = await session.get(Family, draft.family_id)
+        source_amount = draft.source_amount or draft.amount
+        try:
+            amount, rate, rate_date = await convert_amount(
+                source_amount, source_currency, family.currency if family else "ILS", session=session
+            )
+        except ReceiptError as error:
+            await rich.send(bot, message.chat.id, f"<p>{esc(error)}</p>")
+            return
+        draft.amount, draft.source_amount, draft.source_currency = amount, source_amount, source_currency
+        draft.exchange_rate, draft.exchange_rate_date, draft.exchange_rate_source = rate, rate_date, "Bank of Israel"
+        draft.revision += 1
+        html = await draft_html_for_family(session, draft)
+    await state.clear()
+    await rich.edit(bot, message.chat.id, int(prompt_id), html)
 
 
 @router.message(TransactionEditFlow.waiting_value)
@@ -2438,17 +2545,21 @@ async def advanced_value(message: Message, state: FSMContext, bot: Bot) -> None:
 async def text(message: Message, bot: Bot) -> None:
     user = await ensure_user(message)
     if not user.family_id: await rich.send(bot, message.chat.id, "<p>Сначала выполните /start.</p>"); return
+    parser_text, explicit_amount, source_currency, tail = inline_payment_parts(message.text or "")
     async with SessionLocal() as session:
         names = [item.name for item in await list_categories(session, user.family_id)]
         runtime = await get_family_ai_settings(session, user.family_id)
     try:
-        parsed = await ai_parser.parse_text(message.text or "", names, runtime)
+        parsed = await ai_parser.parse_text(parser_text, names, runtime)
     except AIUnavailableError as error:
         await rich.send(bot, message.chat.id, f"<p>{esc(error)}</p>")
         return
     if parsed:
-        amount_only = bool(re.fullmatch(r"\+?\d+(?:[.,]\d{1,2})?", (message.text or "").strip()))
-        await ask_confirmation(message, bot, parsed, choose_category=amount_only)
+        if explicit_amount is not None:
+            parsed = parsed.model_copy(update={"amount": explicit_amount})
+            parsed = normalize_text_comment(parsed, explicit_amount, tail)
+        amount_only = explicit_amount is not None and not tail
+        await ask_confirmation(message, bot, parsed, choose_category=amount_only, source_currency=source_currency)
     else: await rich.send(bot, message.chat.id, "<p>Не удалось распознать операцию. Пример: <code>500 Продукты молоко</code>.</p>")
 
 

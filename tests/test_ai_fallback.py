@@ -1,7 +1,7 @@
 from decimal import Decimal
 
 from app.ai import ParsedTransaction, ReceiptItem, SYSTEM_PROMPT, fallback_parse_text, reconcile_receipt_totals
-from app.rich_bot import draft_html
+from app.rich_bot import draft_html, inline_payment_parts, normalize_text_comment
 
 
 def test_system_prompt_replaces_categories_without_interpreting_json_braces():
@@ -23,6 +23,32 @@ def test_fallback_parse_income():
     assert parsed is not None
     assert parsed.type == "income"
     assert parsed.category == "Зарплата"
+
+
+def test_inline_currency_is_removed_before_text_classification():
+    parser_text, amount, currency, tail = inline_payment_parts("10usd продукты")
+
+    assert parser_text == "10 продукты"
+    assert amount == Decimal("10")
+    assert currency == "USD"
+    assert tail == "продукты"
+
+
+def test_inline_currency_without_space_is_supported():
+    parser_text, amount, currency, tail = inline_payment_parts("10USD")
+
+    assert parser_text == "10"
+    assert amount == Decimal("10")
+    assert currency == "USD"
+    assert tail == ""
+
+
+def test_bare_category_never_becomes_amount_comment():
+    parsed = ParsedTransaction(amount=Decimal("10"), type="expense", category="Продукты", comment="10")
+
+    normalized = normalize_text_comment(parsed, Decimal("10"), "продукты")
+
+    assert normalized.comment is None
 
 
 def test_receipt_discount_is_not_deducted_twice_when_lines_already_match_total():

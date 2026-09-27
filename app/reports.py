@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import and_, func, select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import Budget, Category, Family, Transaction, User
@@ -14,7 +14,7 @@ MONTH_NAMES_RU = ("январь", "февраль", "март", "апрель", 
 
 
 def money(value: Decimal | int | float | None, currency: str = "ILS") -> str:
-    symbols = {"RUB": "₽", "USD": "$", "EUR": "€", "ILS": "₪"}
+    symbols = {"RUB": "₽", "USD": "$", "EUR": "€", "ILS": "₪", "KZT": "₸"}
     return f"{Decimal(value or 0):,.0f}".replace(",", " ") + " " + symbols.get(currency, currency)
 
 
