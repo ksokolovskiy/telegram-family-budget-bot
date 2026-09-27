@@ -1,47 +1,50 @@
-name: Deploy to ksokol2
+name: Deploy
 
 on:
   workflow_dispatch:
 
 concurrency:
-  group: deploy-ksokol2
+  group: production-deploy
   cancel-in-progress: false
+
+permissions:
+  contents: read
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
 
       - name: Prepare SSH
         run: |
           mkdir -p ~/.ssh
           chmod 700 ~/.ssh
-          printf '%s\n' "${{ secrets.KSOKOL2_SSH_KEY }}" > ~/.ssh/ksokol2_key
-          chmod 600 ~/.ssh/ksokol2_key
-          ssh-keyscan -p "${{ secrets.KSOKOL2_PORT || '22' }}" "${{ secrets.KSOKOL2_HOST }}" >> ~/.ssh/known_hosts
+          printf '%s\n' "${{ secrets.DEPLOY_SSH_PRIVATE_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -p "${{ secrets.DEPLOY_SSH_PORT || '22' }}" "${{ secrets.DEPLOY_HOST }}" >> ~/.ssh/known_hosts
 
       - name: Upload source
         run: |
           DEPLOY_PATH="${{ secrets.DEPLOY_PATH }}"
-          ssh -i ~/.ssh/ksokol2_key -p "${{ secrets.KSOKOL2_PORT || '22' }}" "${{ secrets.KSOKOL2_USER }}@${{ secrets.KSOKOL2_HOST }}" "mkdir -p '$DEPLOY_PATH'"
+          ssh -i ~/.ssh/deploy_key -p "${{ secrets.DEPLOY_SSH_PORT || '22' }}" "${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}" "mkdir -p '$DEPLOY_PATH'"
           rsync -az --delete \
-            -e "ssh -i ~/.ssh/ksokol2_key -p ${{ secrets.KSOKOL2_PORT || '22' }}" \
+            -e "ssh -i ~/.ssh/deploy_key -p ${{ secrets.DEPLOY_SSH_PORT || '22' }}" \
             --exclude '.git' --exclude '.env' \
-            ./ "${{ secrets.KSOKOL2_USER }}@${{ secrets.KSOKOL2_HOST }}:$DEPLOY_PATH/"
+            ./ "${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}:$DEPLOY_PATH/"
 
       - name: Configure and restart
         run: |
-          ssh -i ~/.ssh/ksokol2_key -p "${{ secrets.KSOKOL2_PORT || '22' }}" "${{ secrets.KSOKOL2_USER }}@${{ secrets.KSOKOL2_HOST }}" 'bash -s' <<'REMOTE'
+          ssh -i ~/.ssh/deploy_key -p "${{ secrets.DEPLOY_SSH_PORT || '22' }}" "${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}" 'bash -s' <<'REMOTE'
           set -euo pipefail
           cd "${{ secrets.DEPLOY_PATH }}"
 
           DOCKER_NETWORK="${{ secrets.DOCKER_NETWORK }}"
 
           cat > .env <<ENV
-          BOT_TOKEN=${{ secrets.BOT_TOKEN }}
-          OWNER_TELEGRAM_ID=${{ secrets.OWNER_TELEGRAM_ID }}
+          BOT_TOKEN=${{ secrets.TELEGRAM_BOT_TOKEN }}
+          OWNER_TELEGRAM_ID=${{ secrets.BOOTSTRAP_OWNER_TELEGRAM_ID }}
           DATABASE_URL=${{ secrets.DATABASE_URL }}
           DOCKER_NETWORK=${DOCKER_NETWORK}
           ENV

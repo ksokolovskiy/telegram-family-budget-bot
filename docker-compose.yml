@@ -3,15 +3,15 @@ services:
     image: postgres:16-alpine
     container_name: budget-bot-postgres
     environment:
-      POSTGRES_DB: ${LOCAL_POSTGRES_DB:?set in private .env}
-      POSTGRES_USER: ${LOCAL_POSTGRES_USER:?set in private .env}
-      POSTGRES_PASSWORD: ${LOCAL_POSTGRES_PASSWORD:?set in private .env}
+      POSTGRES_DB: ${LOCAL_POSTGRES_DB:-budget_bot}
+      POSTGRES_USER: ${LOCAL_POSTGRES_USER:-budget}
+      POSTGRES_PASSWORD: ${LOCAL_POSTGRES_PASSWORD:-budget}
     ports:
       - "5434:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U budget -d budget_bot"]
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
       interval: 5s
       timeout: 5s
       retries: 20
@@ -23,6 +23,8 @@ services:
         condition: service_healthy
     env_file:
       - .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${LOCAL_POSTGRES_USER:-budget}:${LOCAL_POSTGRES_PASSWORD:-budget}@postgres:5432/${LOCAL_POSTGRES_DB:-budget_bot}
     command: sh -c "alembic upgrade head && python -m app.main"
     restart: unless-stopped
 
@@ -33,6 +35,8 @@ services:
         condition: service_healthy
     env_file:
       - .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${LOCAL_POSTGRES_USER:-budget}:${LOCAL_POSTGRES_PASSWORD:-budget}@postgres:5432/${LOCAL_POSTGRES_DB:-budget_bot}
     command: python -m app.worker
     restart: unless-stopped
 

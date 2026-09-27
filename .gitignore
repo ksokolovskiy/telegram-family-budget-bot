@@ -4,6 +4,13 @@ __pycache__/
 .env
 .env.*
 !.env.example
+.envrc
+.secrets/
+*.sql
+*.dump
+*.bak
+receipts/
+uploads/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/

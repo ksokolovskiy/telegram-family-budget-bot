@@ -1,48 +1,81 @@
-# Telegram Family Budget Bot
+# Family Budget Bot for Telegram
 
-AI-powered Telegram bot for quick family budget tracking: text input, receipt images, categories, monthly budgets and plan/fact reports.
+Privacy-conscious Telegram bot for a shared family budget. Add an expense as text,
+send a receipt, review a monthly report, and keep budgets and recurring payments in
+one place. The user interface is currently Russian-first.
 
-## Local run
+## Features
 
-1. Create a private `.env` (it is ignored by Git) with `BOT_TOKEN`, `OWNER_TELEGRAM_ID` and `DATABASE_URL`.
-2. Start the stack:
+- Quick text input, including ISO currencies (`10usd food`).
+- Image and PDF receipt recognition: item categories, discounts, multi-photo receipts,
+  and a mandatory total check before saving.
+- Invite-only family access, roles, notifications, budgets, recurring operations, and
+  expandable rich Telegram reports.
+- Per-family OpenAI key and model: every family pays for its own AI usage.
+- FX conversion through Frankfurter v2; the rate, date, and source stay with the
+  operation.
+
+## Architecture
+
+- **bot** — Telegram interaction and rich messages;
+- **worker** — recurring operations, receipt cleanup, and FX refresh;
+- **PostgreSQL** — application data, settings, and encrypted family OpenAI keys.
+
+The local compose file starts PostgreSQL. Production expects PostgreSQL supplied by
+the deployment environment.
+
+## Quick start
+
+Requirements: Docker and Docker Compose.
 
 ```bash
+cp .env.example .env
 docker compose up --build
 ```
 
-The local compose file starts a PostgreSQL container and runs Alembic migrations before the bot starts.
+Set the following values in the untracked `.env` before starting:
 
-After the first start, the configured owner opens `/settings` in the bot and
-sets the OpenAI API key, model, application environment and log level. These
-are persisted in PostgreSQL and take effect without a restart; the API key is
-always masked in the interface and is never logged. On its next save, the API
-key is encrypted at rest with Fernet; its key is derived by HKDF from the
-deployment's `BOT_TOKEN`, so no additional `.env` secret is introduced.
-**Rotate the bot token only through a controlled procedure:** while the old
-token is still available, read/decrypt the setting and save it again after
-switching to the new token; otherwise the stored OpenAI key cannot be recovered
-and must be entered again by the owner. The private bootstrap configuration is
-needed before the process can reach the database that stores the other settings.
+```dotenv
+BOT_TOKEN=your_telegram_bot_token
+OWNER_TELEGRAM_ID=your_numeric_telegram_id
+LOCAL_POSTGRES_DB=budget_bot
+LOCAL_POSTGRES_USER=budget
+LOCAL_POSTGRES_PASSWORD=change_me
+```
 
-## Production on ksokol2
+After `/start`, open **Settings** to configure the OpenAI key and model for the
+family. `BOT_TOKEN` and `OWNER_TELEGRAM_ID` are deployment-only; other product
+settings live in the bot. Local Compose builds its database connection internally.
 
-Production deploy is handled by the manual GitHub Actions workflow `.github/workflows/deploy.yml` over SSH. The server is expected to have Docker, Docker Compose, and a PostgreSQL container named `central-postgres` attached to the Docker network used by the app.
-
-Required GitHub secrets:
-
-- `KSOKOL2_HOST`
-- `KSOKOL2_USER`
-- `KSOKOL2_SSH_KEY`
-- `KSOKOL2_PORT` (optional, defaults to `22` in workflow expressions)
-- `BOT_TOKEN`
-- `OWNER_TELEGRAM_ID`
-- `DATABASE_URL`
-- `DOCKER_NETWORK` (Docker network shared with `central-postgres`, for example `central`)
-- `DEPLOY_PATH` (for example `/opt/telegram-family-budget-bot`)
-
-After the secrets are configured, run the `Deploy to ksokol2` workflow manually. It writes the private bootstrap `.env` on the server from secrets and runs:
+## Development
 
 ```bash
-docker compose -f docker-compose.prod.yml up -d --build
+python -m venv .venv
+. .venv/bin/activate
+pip install -e '.[dev]'
+pytest -q
+ruff check app tests
 ```
+
+`run_dev.sh` is a local convenience script; never use it for production.
+
+## Deployment
+
+The manual GitHub Actions workflow deploys over SSH. Configure these repository
+secrets: `DEPLOY_HOST`, `DEPLOY_USER`, `DEPLOY_SSH_PRIVATE_KEY`, `DEPLOY_SSH_PORT`,
+`DEPLOY_PATH`, `DEPLOY_NETWORK`, `TELEGRAM_BOT_TOKEN`,
+`BOOTSTRAP_OWNER_TELEGRAM_ID`, and `DATABASE_URL`.
+
+The target host needs Docker, Docker Compose, and PostgreSQL on the configured
+network. Run **Deploy** manually from the Actions tab.
+
+## Security and privacy
+
+- Never commit `.env`, database exports, receipts, or production logs.
+- The OpenAI key is stored per family and encrypted at rest.
+- An exported database alone does not expose family keys. An attacker with both the
+  database and deployment bot token could decrypt them; protect and rotate that token.
+- Receipt images may be sent to the family-selected AI provider for recognition.
+
+See [SECURITY.md](SECURITY.md), [CONTRIBUTING.md](CONTRIBUTING.md), and the
+[MIT License](LICENSE).
