@@ -3,52 +3,64 @@ name: Deploy
 on:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 concurrency:
   group: production-deploy
   cancel-in-progress: false
 
-permissions:
-  contents: read
-
 jobs:
   deploy:
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    env:
+      DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+      DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+      DEPLOY_PORT: ${{ secrets.DEPLOY_SSH_PORT || '22' }}
+      DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-
-      - name: Prepare SSH
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Prepare SSH and configuration
+        env:
+          SSH_KEY: ${{ secrets.DEPLOY_SSH_PRIVATE_KEY }}
+          SSH_KNOWN_HOSTS: ${{ secrets.DEPLOY_SSH_KNOWN_HOSTS }}
+          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          OWNER_TELEGRAM_ID: ${{ secrets.BOOTSTRAP_OWNER_TELEGRAM_ID }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          DOCKER_NETWORK: ${{ secrets.DEPLOY_NETWORK }}
         run: |
-          mkdir -p ~/.ssh
-          chmod 700 ~/.ssh
-          printf '%s\n' "${{ secrets.DEPLOY_SSH_PRIVATE_KEY }}" > ~/.ssh/deploy_key
-          chmod 600 ~/.ssh/deploy_key
-          ssh-keyscan -p "${{ secrets.DEPLOY_SSH_PORT || '22' }}" "${{ secrets.DEPLOY_HOST }}" >> ~/.ssh/known_hosts
-
-      - name: Upload source
-        run: |
-          DEPLOY_PATH="${{ secrets.DEPLOY_PATH }}"
-          ssh -i ~/.ssh/deploy_key -p "${{ secrets.DEPLOY_SSH_PORT || '22' }}" "${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}" "mkdir -p '$DEPLOY_PATH'"
-          rsync -az --delete \
-            -e "ssh -i ~/.ssh/deploy_key -p ${{ secrets.DEPLOY_SSH_PORT || '22' }}" \
-            --exclude '.git' --exclude '.env' \
-            ./ "${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}:$DEPLOY_PATH/"
-
-      - name: Configure and restart
-        run: |
-          ssh -i ~/.ssh/deploy_key -p "${{ secrets.DEPLOY_SSH_PORT || '22' }}" "${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}" 'bash -s' <<'REMOTE'
           set -euo pipefail
-          cd "${{ secrets.DEPLOY_PATH }}"
-
-          DOCKER_NETWORK="${{ secrets.DOCKER_NETWORK }}"
-
-          cat > .env <<ENV
-          BOT_TOKEN=${{ secrets.TELEGRAM_BOT_TOKEN }}
-          OWNER_TELEGRAM_ID=${{ secrets.BOOTSTRAP_OWNER_TELEGRAM_ID }}
-          DATABASE_URL=${{ secrets.DATABASE_URL }}
-          DOCKER_NETWORK=${DOCKER_NETWORK}
-          ENV
-
-          docker compose -f docker-compose.prod.yml up -d --build
-          docker compose -f docker-compose.prod.yml ps
-          REMOTE
+          [[ "$DEPLOY_PATH" =~ ^/[a-zA-Z0-9_/-]+$ && "$DEPLOY_PATH" != / ]]
+          [[ "$DEPLOY_HOST" =~ ^[a-zA-Z0-9.-]+$ ]]
+          [[ "$DEPLOY_USER" =~ ^[a-zA-Z0-9_-]+$ ]]
+          [[ "$DEPLOY_PORT" =~ ^[0-9]+$ ]]
+          umask 077
+          mkdir -p ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/deploy_key
+          printf '%s\n' "$SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          names = ('BOT_TOKEN', 'OWNER_TELEGRAM_ID', 'DATABASE_URL', 'DOCKER_NETWORK')
+          values = {name: os.environ[name] for name in names}
+          if not all(values.values()):
+              raise SystemExit('Missing deployment configuration')
+          Path(os.environ['RUNNER_TEMP'], 'budget.env').write_text(
+              ''.join(f'{name}={json.dumps(value)}\n' for name, value in values.items())
+          )
+          PY
+      - name: Upload and restart
+        run: |
+          set -euo pipefail
+          SSH="ssh -i $HOME/.ssh/deploy_key -p $DEPLOY_PORT -o BatchMode=yes -o StrictHostKeyChecking=yes"
+          $SSH "$DEPLOY_USER@$DEPLOY_HOST" "mkdir -p '$DEPLOY_PATH'"
+          rsync -az -e "$SSH" --exclude '.git' --exclude '.env*' --exclude '.venv' --exclude 'imports/' --exclude 'logs/' --exclude '__pycache__/' ./ "$DEPLOY_USER@$DEPLOY_HOST:$DEPLOY_PATH/"
+          scp -i ~/.ssh/deploy_key -P "$DEPLOY_PORT" -o BatchMode=yes -o StrictHostKeyChecking=yes "$RUNNER_TEMP/budget.env" "$DEPLOY_USER@$DEPLOY_HOST:$DEPLOY_PATH/.env.next"
+          $SSH "$DEPLOY_USER@$DEPLOY_HOST" "cd '$DEPLOY_PATH' && chmod 600 .env.next && mv .env.next .env && docker compose -f docker-compose.prod.yml build && docker compose -f docker-compose.prod.yml run --rm bot alembic upgrade head && docker compose -f docker-compose.prod.yml up -d && docker compose -f docker-compose.prod.yml ps"
+      - name: Remove runner credentials
+        if: always()
+        run: rm -f ~/.ssh/deploy_key "$RUNNER_TEMP/budget.env"

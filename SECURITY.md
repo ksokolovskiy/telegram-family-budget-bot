@@ -1,7 +1,7 @@
 # Security policy
 
 Do not open a public issue for a suspected vulnerability or exposed credential.
-Contact the repository owner privately through GitHub with a concise description,
+Use [GitHub private vulnerability reporting](https://github.com/ksokolovskiy/telegram-family-budget-bot/security/advisories/new) with a concise description,
 safe reproduction steps, and impact assessment.
 
 Never submit bot tokens, OpenAI keys, database URLs, Telegram media IDs, receipt

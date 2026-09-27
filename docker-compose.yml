@@ -5,9 +5,9 @@ services:
     environment:
       POSTGRES_DB: ${LOCAL_POSTGRES_DB:-budget_bot}
       POSTGRES_USER: ${LOCAL_POSTGRES_USER:-budget}
-      POSTGRES_PASSWORD: ${LOCAL_POSTGRES_PASSWORD:-budget}
+      POSTGRES_PASSWORD: ${LOCAL_POSTGRES_PASSWORD:?set a local database password}
     ports:
-      - "5434:5432"
+      - "127.0.0.1:5434:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -24,7 +24,7 @@ services:
     env_file:
       - .env
     environment:
-      DATABASE_URL: postgresql+asyncpg://${LOCAL_POSTGRES_USER:-budget}:${LOCAL_POSTGRES_PASSWORD:-budget}@postgres:5432/${LOCAL_POSTGRES_DB:-budget_bot}
+      DATABASE_URL: postgresql+asyncpg://${LOCAL_POSTGRES_USER:-budget}:${LOCAL_POSTGRES_PASSWORD:?set a local database password}@postgres:5432/${LOCAL_POSTGRES_DB:-budget_bot}
     command: sh -c "alembic upgrade head && python -m app.main"
     restart: unless-stopped
 
@@ -36,7 +36,7 @@ services:
     env_file:
       - .env
     environment:
-      DATABASE_URL: postgresql+asyncpg://${LOCAL_POSTGRES_USER:-budget}:${LOCAL_POSTGRES_PASSWORD:-budget}@postgres:5432/${LOCAL_POSTGRES_DB:-budget_bot}
+      DATABASE_URL: postgresql+asyncpg://${LOCAL_POSTGRES_USER:-budget}:${LOCAL_POSTGRES_PASSWORD:?set a local database password}@postgres:5432/${LOCAL_POSTGRES_DB:-budget_bot}
     command: python -m app.worker
     restart: unless-stopped
 

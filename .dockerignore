@@ -7,3 +7,11 @@ __pycache__
 .env
 .env.*
 !.env.example
+imports/
+logs/
+receipts/
+uploads/
+*.dump
+*.sql
+*.bak
+*.sqlite*

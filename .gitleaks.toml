@@ -1,5 +1,8 @@
 title = "Family Budget Bot allowlist"
 
+[extend]
+  useDefault = true
+
 [allowlist]
   description = "Historical placeholder credentials only; never add real values here."
   regexes = [

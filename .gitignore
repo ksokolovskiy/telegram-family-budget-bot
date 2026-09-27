@@ -11,6 +11,9 @@ __pycache__/
 *.bak
 receipts/
 uploads/
+imports/
+*.sqlite
+*.sqlite3
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
