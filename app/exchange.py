@@ -1,10 +1,10 @@
-"""Official Bank of Israel exchange rates and a durable refresh fallback."""
+"""Currency conversion through Frankfurter v2 with durable quote provenance."""
 from __future__ import annotations
 
 import json
-from datetime import date, datetime, timedelta, timezone
+from dataclasses import dataclass
+from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
-from xml.etree import ElementTree
 
 import aiohttp
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -12,84 +12,76 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models import AppSetting
 from app.receipts import ReceiptError
 
-BOI_RATES_URL = "https://www.boi.org.il/PublicApi/GetExchangeRates"
-NBK_RATES_URL = "https://nationalbank.kz/rss/get_rates.cfm?fdate={date}"
-BOI_CACHE_KEY = "boi_exchange_rates_v1"
+FRANKFURTER_API_URL = "https://api.frankfurter.dev/v2"
+FRANKFURTER_CACHE_PREFIX = "frankfurter_v2_quote:"
 
 
-def exchange_rate_source(source: str, target: str) -> str:
-    """Human-readable provenance stored with an immutable transaction."""
-    return "Bank of Israel + NB Kazakhstan" if "KZT" in {source.upper(), target.upper()} else "Bank of Israel"
+@dataclass(frozen=True)
+class FXQuote:
+    rate: Decimal
+    quote_date: date
+    source: str
 
 
-async def fetch_boi_rates() -> tuple[dict[str, Decimal], date]:
-    """Fetch the published daily table; never invent a rate or a rate date."""
-    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=12)) as client:
-        async with client.get(BOI_RATES_URL) as response:
+def preferred_providers(source: str, target: str) -> list[str]:
+    """Use a direct official source where it covers the pair before blending."""
+    currencies = {source.upper(), target.upper()}
+    if "KZT" in currencies:
+        return ["nbk"]
+    if "ILS" in currencies:
+        return ["boi"]
+    return ["ecb"]
+
+
+def _quote_from_payload(payload: dict, source_label: str) -> FXQuote:
+    try:
+        rate = Decimal(str(payload["rate"]))
+        quote_date = date.fromisoformat(str(payload["date"]))
+    except (KeyError, TypeError, ValueError, InvalidOperation) as error:
+        raise ReceiptError("Frankfurter вернул некорректный курс. Попробуйте позже.") from error
+    if rate <= 0:
+        raise ReceiptError("Frankfurter вернул некорректный курс. Попробуйте позже.")
+    return FXQuote(rate=rate, quote_date=quote_date, source=source_label)
+
+
+async def fetch_frankfurter_rate(source: str, target: str) -> FXQuote:
+    """Get the latest quote, preferring a single official central bank.
+
+    A pair unsupported by that bank falls back to Frankfurter's documented
+    blend of official providers. The label stored with the transaction makes
+    that distinction visible and immutable.
+    """
+    source, target = source.upper(), target.upper()
+    timeout = aiohttp.ClientTimeout(total=12)
+    async with aiohttp.ClientSession(timeout=timeout) as client:
+        for provider in preferred_providers(source, target):
+            url = f"{FRANKFURTER_API_URL}/providers/{provider}/rate/{source.lower()}/{target.lower()}"
+            async with client.get(url) as response:
+                if response.status in {404, 422}:
+                    continue
+                response.raise_for_status()
+                return _quote_from_payload(await response.json(), f"Frankfurter v2 / {provider.upper()}")
+
+        url = f"{FRANKFURTER_API_URL}/rate/{source.lower()}/{target.lower()}?expand=providers"
+        async with client.get(url) as response:
             response.raise_for_status()
             payload = await response.json()
-    rates = {
-        str(item["key"]).upper(): Decimal(str(item["currentExchangeRate"])) / Decimal(str(item.get("unit") or 1))
-        for item in payload.get("exchangeRates", [])
-    }
-    if not rates:
-        raise ReceiptError("Банк Израиля вернул пустой список курсов. Попробуйте позже.")
-    update_dates = [
-        datetime.fromisoformat(str(item["lastUpdate"]).replace("Z", "+00:00")).date()
-        for item in payload.get("exchangeRates", [])
-        if item.get("lastUpdate")
-    ]
-    rates["ILS"] = Decimal("1")
-    return rates, max(update_dates, default=date.today())
+    providers = payload.get("providers") if isinstance(payload, dict) else None
+    count = len(providers) if isinstance(providers, list) else 0
+    return _quote_from_payload(payload, f"Frankfurter v2 / blended ({count} providers)")
 
 
-async def fetch_kzt_ils_rate() -> tuple[Decimal, date]:
-    """Get the official KZT/ILS cross-rate published by Kazakhstan's NBK.
-
-    The Bank of Israel does not publish KZT. NBK does publish ILS/KZT and
-    calculates its non-USD pairs through its own official cross-rate process.
-    A weekend can have no new quote, so use the latest published business day.
-    """
-    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=12)) as client:
-        for days_back in range(8):
-            quote_date = date.today() - timedelta(days=days_back)
-            url = NBK_RATES_URL.format(date=quote_date.strftime("%d.%m.%Y"))
-            try:
-                async with client.get(url) as response:
-                    response.raise_for_status()
-                    content = await response.read()
-                root = ElementTree.fromstring(content)
-                published = datetime.strptime(root.findtext("date", ""), "%d.%m.%Y").date()
-                for item in root.findall("item"):
-                    if (item.findtext("title") or "").strip().upper() != "ILS":
-                        continue
-                    kzt_per_unit = Decimal((item.findtext("description") or "").strip().replace(",", "."))
-                    units = Decimal((item.findtext("quant") or "1").strip())
-                    if kzt_per_unit <= 0 or units <= 0:
-                        break
-                    return units / kzt_per_unit, published
-            except (aiohttp.ClientError, TimeoutError, ElementTree.ParseError, ValueError, InvalidOperation, ArithmeticError):
-                continue
-    raise ReceiptError("Не удалось обновить официальный курс KZT Национального банка Казахстана.")
+def _cache_key(source: str, target: str) -> str:
+    return f"{FRANKFURTER_CACHE_PREFIX}{source.upper()}:{target.upper()}"
 
 
-async def refresh_boi_rates(session: AsyncSession) -> tuple[dict[str, Decimal], date]:
-    """Persist the official table so temporary BOI outages don't stop drafts."""
-    rates, rate_date = await fetch_boi_rates()
-    try:
-        rates["KZT"], kzt_date = await fetch_kzt_ils_rate()
-        # A KZT conversion uses both official sources; report the older quote
-        # date instead of pretending that both were refreshed later.
-        rate_date = min(rate_date, kzt_date)
-    except ReceiptError:
-        cached = await cached_boi_rates(session)
-        if cached and "KZT" in cached[0]:
-            rates["KZT"] = cached[0]["KZT"]
-    setting = await session.get(AppSetting, BOI_CACHE_KEY)
+async def cache_frankfurter_quote(session: AsyncSession, source: str, target: str, quote: FXQuote) -> None:
+    setting = await session.get(AppSetting, _cache_key(source, target))
     payload = json.dumps(
         {
-            "rates": {code: str(rate) for code, rate in rates.items()},
-            "rate_date": rate_date.isoformat(),
+            "rate": str(quote.rate),
+            "quote_date": quote.quote_date.isoformat(),
+            "source": quote.source,
             "fetched_at": datetime.now(timezone.utc).isoformat(),
         },
         separators=(",", ":"),
@@ -97,45 +89,55 @@ async def refresh_boi_rates(session: AsyncSession) -> tuple[dict[str, Decimal], 
     if setting:
         setting.value = payload
     else:
-        session.add(AppSetting(key=BOI_CACHE_KEY, value=payload))
-    return rates, rate_date
+        session.add(AppSetting(key=_cache_key(source, target), value=payload))
 
 
-async def cached_boi_rates(session: AsyncSession) -> tuple[dict[str, Decimal], date] | None:
-    setting = await session.get(AppSetting, BOI_CACHE_KEY)
+async def cached_frankfurter_quote(session: AsyncSession, source: str, target: str) -> FXQuote | None:
+    setting = await session.get(AppSetting, _cache_key(source, target))
     if not setting:
         return None
     try:
         payload = json.loads(setting.value)
-        rates = {str(code).upper(): Decimal(str(value)) for code, value in payload["rates"].items()}
-        return rates, date.fromisoformat(payload["rate_date"])
-    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return FXQuote(
+            rate=Decimal(str(payload["rate"])),
+            quote_date=date.fromisoformat(payload["quote_date"]),
+            source=str(payload["source"]),
+        )
+    except (KeyError, TypeError, ValueError, InvalidOperation, json.JSONDecodeError):
         return None
+
+
+async def refresh_frankfurter_rates(session: AsyncSession) -> date:
+    """Warm common quotes; every conversion still obtains a fresh pair quote."""
+    newest: date | None = None
+    for source, target in (("USD", "ILS"), ("EUR", "ILS"), ("KZT", "ILS")):
+        try:
+            quote = await fetch_frankfurter_rate(source, target)
+            await cache_frankfurter_quote(session, source, target, quote)
+            newest = max(newest, quote.quote_date) if newest else quote.quote_date
+        except (aiohttp.ClientError, TimeoutError, ReceiptError):
+            continue
+    if newest is None:
+        raise ReceiptError("Не удалось обновить курсы Frankfurter. Попробуйте позже.")
+    return newest
 
 
 async def convert_amount(
     amount: Decimal, source: str, target: str, *, session: AsyncSession | None = None
-) -> tuple[Decimal, Decimal, date]:
+) -> tuple[Decimal, Decimal, date, str]:
+    """Convert at the latest Frankfurter quote and retain exact provenance."""
     source, target = source.upper(), target.upper()
     if source == target:
-        return amount.quantize(Decimal("0.01")), Decimal("1"), date.today()
+        return amount.quantize(Decimal("0.01")), Decimal("1"), date.today(), "family_currency"
     try:
-        if session is None:
-            rates, rate_date = await fetch_boi_rates()
-            if "KZT" in {source, target}:
-                rates["KZT"], kzt_date = await fetch_kzt_ils_rate()
-                rate_date = min(rate_date, kzt_date)
-        else:
-            rates, rate_date = await refresh_boi_rates(session)
+        quote = await fetch_frankfurter_rate(source, target)
+        if session is not None:
+            await cache_frankfurter_quote(session, source, target, quote)
     except (aiohttp.ClientError, TimeoutError, ReceiptError):
-        cached = await cached_boi_rates(session) if session is not None else None
-        if not cached:
-            raise ReceiptError("Не удалось обновить курсы Банка Израиля. Попробуйте позже.")
-        rates, rate_date = cached
-    if source not in rates or target not in rates:
-        raise ReceiptError(
-            f"Банк Израиля не публикует курс для пары {source}/{target}. "
-            "Эту валюту можно хранить как валюту семьи, но автоматически конвертировать её сейчас нельзя."
-        )
-    multiplier = rates[source] / rates[target]
-    return (amount * multiplier).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP), multiplier, rate_date
+        quote = await cached_frankfurter_quote(session, source, target) if session is not None else None
+        if not quote:
+            raise ReceiptError(
+                f"Не удалось получить курс Frankfurter для пары {source}/{target}. Попробуйте позже."
+            )
+    converted = (amount * quote.rate).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    return converted, quote.rate, quote.quote_date, quote.source

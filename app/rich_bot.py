@@ -31,7 +31,7 @@ from app.config import settings
 from app.db import SessionLocal
 from app.models import Account, Category, Family, FamilyInvite, InteractiveScreen, RecurringTransaction, Transaction, TransactionDraft, Transfer, User
 from app.reports import build_report_html, money, period_bounds, period_title, report_rows, shift_anchor
-from app.exchange import convert_amount, exchange_rate_source
+from app.exchange import convert_amount
 from app.receipts import ENABLE_RECEIPT_URLS, ReceiptError, extract_pdf_text, fetch_receipt_url, is_http_url, render_pdf_pages
 from app.repositories import (
     add_transaction, copy_budgets_from_period, create_account, create_category, create_family_for_user,
@@ -1764,11 +1764,12 @@ async def ask_confirmation(
         rate, rate_date, rate_source = Decimal("1"), datetime.now(timezone.utc).date(), "family_currency"
         if document_currency != family_currency:
             try:
-                amount, rate, rate_date = await convert_amount(source_amount, document_currency, family_currency, session=session)
+                amount, rate, rate_date, rate_source = await convert_amount(
+                    source_amount, document_currency, family_currency, session=session
+                )
             except ReceiptError as error:
                 await rich.send(bot, message.chat.id, f"<p>{esc(error)}</p>")
                 return
-            rate_source = exchange_rate_source(document_currency, family_currency)
         session.add(TransactionDraft(token=token, user_id=user.id, family_id=user.family_id, chat_id=message.chat.id, message_id=None, amount=amount, source_amount=source_amount, source_currency=document_currency, exchange_rate=rate, exchange_rate_date=rate_date, exchange_rate_source=rate_source, type=parsed.type, category=parsed.category, comment=parsed.comment, receipt_file_id=receipt_file_id, receipt_mime_type=receipt_mime_type, receipt_attachments=[{"file_id": file_id, "mime_type": mime_type} for file_id, mime_type in receipt_attachments] if receipt_attachments else None, items=[item.model_dump(mode="json") for item in parsed.items] or None, receipt_discount=parsed.receipt_discount, expires_at=expiry()))
     if choose_category:
         async with SessionLocal() as session:
@@ -2095,12 +2096,14 @@ async def transaction_currency(callback: CallbackQuery, state: FSMContext, bot: 
         family = await session.get(Family, draft.family_id)
         source_amount = draft.source_amount or draft.amount
         try:
-            amount, rate, rate_date = await convert_amount(source_amount, source_currency, family.currency if family else "ILS", session=session)
+            amount, rate, rate_date, rate_source = await convert_amount(
+                source_amount, source_currency, family.currency if family else "ILS", session=session
+            )
         except ReceiptError as error:
             await callback.answer(str(error), show_alert=True)
             return
         draft.amount, draft.source_amount, draft.source_currency = amount, source_amount, source_currency
-        draft.exchange_rate, draft.exchange_rate_date, draft.exchange_rate_source = rate, rate_date, exchange_rate_source(source_currency, family.currency if family else "ILS")
+        draft.exchange_rate, draft.exchange_rate_date, draft.exchange_rate_source = rate, rate_date, rate_source
         draft.revision += 1
         html = await draft_html_for_family(session, draft)
     await rich.edit(bot, callback.message.chat.id, callback.message.message_id, html)
@@ -2226,14 +2229,14 @@ async def typed_transaction_currency(message: Message, state: FSMContext, bot: B
         family = await session.get(Family, draft.family_id)
         source_amount = draft.source_amount or draft.amount
         try:
-            amount, rate, rate_date = await convert_amount(
+            amount, rate, rate_date, rate_source = await convert_amount(
                 source_amount, source_currency, family.currency if family else "ILS", session=session
             )
         except ReceiptError as error:
             await rich.send(bot, message.chat.id, f"<p>{esc(error)}</p>")
             return
         draft.amount, draft.source_amount, draft.source_currency = amount, source_amount, source_currency
-        draft.exchange_rate, draft.exchange_rate_date, draft.exchange_rate_source = rate, rate_date, exchange_rate_source(source_currency, family.currency if family else "ILS")
+        draft.exchange_rate, draft.exchange_rate_date, draft.exchange_rate_source = rate, rate_date, rate_source
         draft.revision += 1
         html = await draft_html_for_family(session, draft)
     await state.clear()
