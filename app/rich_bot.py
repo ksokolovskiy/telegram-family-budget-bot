@@ -31,7 +31,7 @@ from app.config import settings
 from app.db import SessionLocal
 from app.models import Account, Category, Family, FamilyInvite, InteractiveScreen, RecurringTransaction, Transaction, TransactionDraft, Transfer, User
 from app.reports import build_report_html, money, period_bounds, period_title, report_rows, shift_anchor
-from app.exchange import convert_amount
+from app.exchange import convert_amount, exchange_rate_source
 from app.receipts import ENABLE_RECEIPT_URLS, ReceiptError, extract_pdf_text, fetch_receipt_url, is_http_url, render_pdf_pages
 from app.repositories import (
     add_transaction, copy_budgets_from_period, create_account, create_category, create_family_for_user,
@@ -1188,9 +1188,25 @@ async def transaction_detail(callback: CallbackQuery, bot: Bot) -> None:
         if tx.receipt_file_id
         else "Чек не прикреплён"
     )
+    family_currency = family.currency if family else "ILS"
+    operation_currency = tx.source_currency or family_currency
+    operation_amount = tx.source_amount or tx.amount
+    if operation_currency == family_currency:
+        amount_rows = (
+            f"<tr><td>Сумма</td><td>{esc(money(tx.amount, family_currency))}</td>"
+            f"<td>{link(f'txe:{tx.id}:amount', '✎') if can_manage_family(user) else ''}</td></tr>"
+        )
+    else:
+        family_amount_label = "Сумма в шекелях" if family_currency == "ILS" else f"Сумма в {family_currency}"
+        amount_rows = (
+            f"<tr><td>Сумма операции</td><td>{esc(money(operation_amount, operation_currency))}</td><td></td></tr>"
+            f"<tr><td>{family_amount_label}</td><td>{esc(money(tx.amount, family_currency))}</td>"
+            f"<td>{link(f'txe:{tx.id}:amount', '✎') if can_manage_family(user) else ''}</td></tr>"
+            f"<tr><td>Курс</td><td>{esc(str(tx.exchange_rate or '—'))} · {esc(tx.exchange_rate_source or '—')}</td><td></td></tr>"
+        )
     html = (
         f"<h3>Операция №{tx.id}</h3><table><tr><th>Поле</th><th>Значение</th><th></th></tr>"
-        f"<tr><td>Сумма</td><td>{esc(money(tx.amount, family.currency if family else 'ILS'))}</td><td>{link(f'txe:{tx.id}:amount', '✎') if can_manage_family(user) else ''}</td></tr>"
+        f"{amount_rows}"
         f"<tr><td>Тип</td><td>{'Доход' if tx.type == 'income' else 'Расход'}</td><td>{link(f'txe:{tx.id}:type', '✎') if can_manage_family(user) else ''}</td></tr>"
         f"<tr><td>Категория</td><td>{esc(category.name)}</td><td>{link(f'txe:{tx.id}:category', '✎') if can_manage_family(user) else ''}</td></tr>"
         f"<tr><td>Комментарий</td><td>{esc(tx.comment or '—')}</td><td>{link(f'txe:{tx.id}:comment', '✎') if can_manage_family(user) else ''}</td></tr>"
@@ -1751,7 +1767,7 @@ async def ask_confirmation(
             except ReceiptError as error:
                 await rich.send(bot, message.chat.id, f"<p>{esc(error)}</p>")
                 return
-            rate_source = "Bank of Israel"
+            rate_source = exchange_rate_source(document_currency, family_currency)
         session.add(TransactionDraft(token=token, user_id=user.id, family_id=user.family_id, chat_id=message.chat.id, message_id=None, amount=amount, source_amount=source_amount, source_currency=document_currency, exchange_rate=rate, exchange_rate_date=rate_date, exchange_rate_source=rate_source, type=parsed.type, category=parsed.category, comment=parsed.comment, receipt_file_id=receipt_file_id, receipt_mime_type=receipt_mime_type, items=[item.model_dump(mode="json") for item in parsed.items] or None, receipt_discount=parsed.receipt_discount, expires_at=expiry()))
     if choose_category:
         async with SessionLocal() as session:
@@ -2070,7 +2086,7 @@ async def transaction_currency(callback: CallbackQuery, state: FSMContext, bot: 
             await callback.answer(str(error), show_alert=True)
             return
         draft.amount, draft.source_amount, draft.source_currency = amount, source_amount, source_currency
-        draft.exchange_rate, draft.exchange_rate_date, draft.exchange_rate_source = rate, rate_date, "Bank of Israel"
+        draft.exchange_rate, draft.exchange_rate_date, draft.exchange_rate_source = rate, rate_date, exchange_rate_source(source_currency, family.currency if family else "ILS")
         draft.revision += 1
         html = await draft_html_for_family(session, draft)
     await rich.edit(bot, callback.message.chat.id, callback.message.message_id, html)
@@ -2203,7 +2219,7 @@ async def typed_transaction_currency(message: Message, state: FSMContext, bot: B
             await rich.send(bot, message.chat.id, f"<p>{esc(error)}</p>")
             return
         draft.amount, draft.source_amount, draft.source_currency = amount, source_amount, source_currency
-        draft.exchange_rate, draft.exchange_rate_date, draft.exchange_rate_source = rate, rate_date, "Bank of Israel"
+        draft.exchange_rate, draft.exchange_rate_date, draft.exchange_rate_source = rate, rate_date, exchange_rate_source(source_currency, family.currency if family else "ILS")
         draft.revision += 1
         html = await draft_html_for_family(session, draft)
     await state.clear()
