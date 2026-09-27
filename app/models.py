@@ -276,6 +276,8 @@ class TransactionDraft(Base):
     comment: Mapped[str | None] = mapped_column(Text())
     receipt_file_id: Mapped[str | None] = mapped_column(String(255))
     receipt_mime_type: Mapped[str | None] = mapped_column(String(120))
+    # Every source page is retained for a faithful retry of a multi-photo receipt.
+    receipt_attachments: Mapped[list[dict[str, str]] | None] = mapped_column(JSON)
     items: Mapped[list[dict[str, Any]] | None] = mapped_column(JSON)
     receipt_discount: Mapped[Decimal] = mapped_column(Numeric(12, 2), default=0, server_default="0")
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)

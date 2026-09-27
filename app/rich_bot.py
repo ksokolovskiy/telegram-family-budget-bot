@@ -26,7 +26,7 @@ from aiogram.types import BotCommand, CallbackQuery, Message
 from openai import AsyncOpenAI
 from sqlalchemy import func, select
 
-from app.ai import AIParser, AIUnavailableError, ParsedTransaction, reconcile_receipt_totals
+from app.ai import AIParser, AIUnavailableError, ParsedTransaction
 from app.config import settings
 from app.db import SessionLocal
 from app.models import Account, Category, Family, FamilyInvite, InteractiveScreen, RecurringTransaction, Transaction, TransactionDraft, Transfer, User
@@ -1741,6 +1741,7 @@ async def ask_confirmation(
     parsed: ParsedTransaction,
     receipt_file_id: str | None = None,
     receipt_mime_type: str | None = None,
+    receipt_attachments: list[tuple[str, str]] | None = None,
     choose_category: bool = False,
     user: User | None = None,
     source_currency: str | None = None,
@@ -1756,7 +1757,7 @@ async def ask_confirmation(
         values = await get_values(session)
         family = await session.get(Family, user.family_id)
         if values.get("receipt_storage") == "do_not_retain" or not family or family.receipt_retention_days == 0:
-            receipt_file_id, receipt_mime_type = None, None
+            receipt_file_id, receipt_mime_type, receipt_attachments = None, None, None
         family_currency = family.currency if family else "ILS"
         document_currency = (source_currency or family_currency).upper()
         source_amount, amount = parsed.amount, parsed.amount
@@ -1768,7 +1769,7 @@ async def ask_confirmation(
                 await rich.send(bot, message.chat.id, f"<p>{esc(error)}</p>")
                 return
             rate_source = exchange_rate_source(document_currency, family_currency)
-        session.add(TransactionDraft(token=token, user_id=user.id, family_id=user.family_id, chat_id=message.chat.id, message_id=None, amount=amount, source_amount=source_amount, source_currency=document_currency, exchange_rate=rate, exchange_rate_date=rate_date, exchange_rate_source=rate_source, type=parsed.type, category=parsed.category, comment=parsed.comment, receipt_file_id=receipt_file_id, receipt_mime_type=receipt_mime_type, items=[item.model_dump(mode="json") for item in parsed.items] or None, receipt_discount=parsed.receipt_discount, expires_at=expiry()))
+        session.add(TransactionDraft(token=token, user_id=user.id, family_id=user.family_id, chat_id=message.chat.id, message_id=None, amount=amount, source_amount=source_amount, source_currency=document_currency, exchange_rate=rate, exchange_rate_date=rate_date, exchange_rate_source=rate_source, type=parsed.type, category=parsed.category, comment=parsed.comment, receipt_file_id=receipt_file_id, receipt_mime_type=receipt_mime_type, receipt_attachments=[{"file_id": file_id, "mime_type": mime_type} for file_id, mime_type in receipt_attachments] if receipt_attachments else None, items=[item.model_dump(mode="json") for item in parsed.items] or None, receipt_discount=parsed.receipt_discount, expires_at=expiry()))
     if choose_category:
         async with SessionLocal() as session:
             categories = await list_categories(session, user.family_id, parsed.type)
@@ -1962,12 +1963,25 @@ async def transaction_action(callback: CallbackQuery, state: FSMContext, bot: Bo
                 return
             names = [item.name for item in await list_categories(session, draft.family_id)]
             runtime = await get_family_ai_settings(session, draft.family_id)
-            file_id, mime_type = draft.receipt_file_id, draft.receipt_mime_type or "image/jpeg"
+            attachments = draft.receipt_attachments or [{
+                "file_id": draft.receipt_file_id,
+                "mime_type": draft.receipt_mime_type or "image/jpeg",
+            }]
         await callback.answer("Повторно распознаю чек…")
         try:
-            file = await bot.get_file(file_id)
-            content = await bot.download_file(file.file_path)
-            parsed = await parse_receipt_file(content.read(), mime_type, names, runtime)
+            pages: list[tuple[bytes, str]] = []
+            for attachment in attachments:
+                file_id = attachment.get("file_id")
+                mime_type = attachment.get("mime_type") or "image/jpeg"
+                if not file_id:
+                    continue
+                file = await bot.get_file(file_id)
+                raw = (await bot.download_file(file.file_path)).read()
+                if mime_type.lower() == "application/pdf":
+                    pages.extend(render_pdf_pages(raw))
+                else:
+                    pages.append((raw, mime_type))
+            parsed = await ai_parser.parse_receipt_images(pages, names, runtime)
         except (ReceiptError, AIUnavailableError) as error:
             await rich.send(bot, callback.message.chat.id, f"<p>{esc(error)}</p>")
             return
@@ -2314,12 +2328,10 @@ async def parse_receipt_file(
     content: bytes, mime_type: str, categories: list[str], runtime
 ) -> ParsedTransaction | None:
     if mime_type.lower() == "application/pdf":
-        parsed = await ai_parser.parse_images(
+        return await ai_parser.parse_receipt_images(
             render_pdf_pages(content), categories, runtime, native_text=extract_pdf_text(content)
         )
-    else:
-        parsed = await ai_parser.parse_image(content, mime_type, categories, runtime)
-    return reconcile_receipt_totals(parsed)
+    return await ai_parser.parse_receipt_images([(content, mime_type)], categories, runtime)
 
 
 def receipt_attachment(message: Message) -> tuple[str, str] | None:
@@ -2366,8 +2378,7 @@ async def recognize_receipt_messages(messages: list[Message], bot: Bot, one_rece
                 pages.extend(render_pdf_pages(raw))
             else:
                 pages.append((raw, mime_type))
-        parsed = await ai_parser.parse_images(pages, names, runtime)
-        parsed = reconcile_receipt_totals(parsed)
+        parsed = await ai_parser.parse_receipt_images(pages, names, runtime)
     except (ReceiptError, AIUnavailableError) as error:
         await rich.send(bot, messages[0].chat.id, f"<p>{esc(error)}</p>")
         return
@@ -2375,7 +2386,10 @@ async def recognize_receipt_messages(messages: list[Message], bot: Bot, one_rece
         await rich.send(bot, messages[0].chat.id, "<p>Не удалось распознать чек. Пришлите страницы ещё раз или введите операцию вручную.</p>")
         return
     file_id, mime_type = attachments[0]
-    await ask_confirmation(messages[0], bot, parsed, receipt_file_id=file_id, receipt_mime_type=mime_type)
+    await ask_confirmation(
+        messages[0], bot, parsed, receipt_file_id=file_id, receipt_mime_type=mime_type,
+        receipt_attachments=attachments,
+    )
 
 
 async def flush_receipt_album(key: str, bot: Bot) -> None:

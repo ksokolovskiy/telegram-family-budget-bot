@@ -24,14 +24,23 @@ SYSTEM_PROMPT = """Вы — строго структурированный мо
 Сначала извлеките факты, затем классифицируйте. Сумма amount — только напечатанный
 итог к оплате (TOTAL / סה״כ / לתשלום), не subtotal и не сумма скидки. Каждая
 товарная строка чека должна быть отдельным items: сохраняйте напечатанную сумму
-строки, не пересчитывайте её, не объединяйте одинаковые товары и не включайте в
-items subtotal, НДС, способ оплаты, сдачу, итог или строку скидки.
+строки, не объединяйте одинаковые товары и не включайте в items subtotal, НДС,
+способ оплаты, сдачу, итог или строку скидки.
 
-receipt_discount указывайте только для явно напечатанной скидки на ВЕСЬ чек,
-которая ещё НЕ включена в суммах items. Если items уже в сумме равны amount,
-receipt_discount обязан быть 0. Скидку конкретного товара указывайте только в
-item_discount этого товара. Не придумывайте скидку и не выполняйте арифметику
-за кассу: переписывайте цены с чека.
+Отрицательная строка рядом с товаром или строка акции — это важный факт, а не
+строка, которую можно пропустить. Свяжите её с товаром/товарами, к которым она
+относится. Для item укажите amount после такой скидки, а item_discount — полную
+сумму скидки этого товара. Если скидка распространяется на несколько явно
+указанных товаров, распределите её между ними без потери копеек. Если скидка
+напечатана на ВЕСЬ чек и её нельзя отнести к товарам, укажите её в
+receipt_discount. При этом сумма всех items минус receipt_discount обязана
+равняться напечатанному итогу с точностью до одной агоры. Не придумывайте скидку:
+используйте только отрицательные строки и условия акций, напечатанные на чеке.
+
+Если приложено несколько изображений, они могут быть перекрывающимися частями
+одного длинного чека. Рассматривайте их как последовательность страниц: строка,
+видимая в перекрытии на двух фото, является одним товаром и должна попасть в
+items ровно один раз.
 
 Категория каждого товара должна быть ровно одной из переданных категорий. Еда,
 напитки и продукты всегда «Продукты», если такая категория есть, даже в чеке из
@@ -147,6 +156,14 @@ def reconcile_receipt_totals(parsed: ParsedTransaction | None) -> ParsedTransact
     return parsed.model_copy(update={"items": [*parsed.items, adjustment]})
 
 
+def receipt_totals_match(parsed: ParsedTransaction | None) -> bool:
+    """Whether extracted lines reconcile exactly with the printed total."""
+    if not parsed or not parsed.items:
+        return True
+    item_total = sum((item.amount for item in parsed.items), Decimal("0")) - parsed.receipt_discount
+    return abs(item_total - parsed.amount) <= Decimal("0.01")
+
+
 class AIParser:
     def __init__(self) -> None:
         self.client: AsyncOpenAI | None = None
@@ -187,6 +204,52 @@ class AIParser:
             content,
             categories, runtime,
         )
+
+    async def parse_receipt_images(
+        self,
+        images: list[tuple[bytes, str]],
+        categories: list[str],
+        runtime: FamilyAISettings,
+        native_text: str | None = None,
+    ) -> ParsedTransaction | None:
+        """Extract a receipt and make one focused repair attempt if it does not add up.
+
+        A meaningful mismatch is usually a missed discount, promotion or an
+        overlap between receipt photos. It is safer to inspect those facts once
+        more than to show an unusable draft or invent a balancing adjustment.
+        """
+        parsed = reconcile_receipt_totals(
+            await self.parse_images(images, categories, runtime, native_text=native_text)
+        )
+        if receipt_totals_match(parsed):
+            return parsed
+
+        assert parsed is not None  # guarded by receipt_totals_match above
+        original = parsed.model_dump(mode="json")
+        item_total = sum((item.amount for item in parsed.items), Decimal("0"))
+        repair_content: list[dict[str, Any]] = [{
+            "type": "text",
+            "text": (
+                "Проверьте распознавание чека ещё раз. Предыдущий черновик не "
+                "сошёлся: сумма позиций за вычетом скидки не равна напечатанному "
+                "итогу. Найдите пропущенные или неверно привязанные отрицательные "
+                "строки скидок/акций и возможные задвоенные строки в перекрытии "
+                "фото. Верните ПОЛНОСТЬЮ исправленный JSON по исходным фото, а не "
+                "объяснение. Не добавляйте выдуманную корректировку.\n\n"
+                f"Предыдущий черновик: {json.dumps(original, ensure_ascii=False)}\n"
+                f"Сумма позиций минус скидка: {item_total - parsed.receipt_discount}; "
+                f"напечатанный итог: {parsed.amount}."
+            ),
+        }]
+        if native_text:
+            repair_content.append({"type": "text", "text": "Текстовый слой PDF:\n" + native_text})
+        for image_bytes, mime_type in images:
+            data_url = f"data:{mime_type};base64,{base64.b64encode(image_bytes).decode('ascii')}"
+            repair_content.append({"type": "image_url", "image_url": {"url": data_url, "detail": "high"}})
+        repaired = reconcile_receipt_totals(await self._parse(repair_content, categories, runtime))
+        # A provider failure on the repair pass must not discard the original:
+        # it remains a safe, non-actionable draft with a retry action.
+        return repaired or parsed
 
     async def _parse(self, content: list[dict[str, Any]], categories: list[str], runtime: FamilyAISettings) -> ParsedTransaction | None:
         # Keep a local reference. Another family's simultaneous request may

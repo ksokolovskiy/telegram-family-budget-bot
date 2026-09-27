@@ -1,6 +1,14 @@
 from decimal import Decimal
 
-from app.ai import ParsedTransaction, ReceiptItem, SYSTEM_PROMPT, fallback_parse_text, reconcile_receipt_totals
+from app.ai import (
+    AIParser,
+    ParsedTransaction,
+    ReceiptItem,
+    SYSTEM_PROMPT,
+    fallback_parse_text,
+    reconcile_receipt_totals,
+    receipt_totals_match,
+)
 from app.rich_bot import draft_html, inline_payment_parts, normalize_text_comment
 
 
@@ -103,3 +111,31 @@ def test_unbalanced_receipt_is_never_rendered_as_actionable_draft():
     assert "Не удалось сверить чек" in html
     assert "Распознать заново" in html
     assert "Записать" not in html
+
+
+async def test_receipt_parser_repairs_a_large_mismatch_before_returning_a_draft(monkeypatch):
+    parser = AIParser()
+    first = ParsedTransaction(
+        amount=Decimal("100"), type="expense", category="Продукты",
+        items=[ReceiptItem(name="товар", amount=Decimal("120"), category="Продукты")],
+    )
+    repaired = ParsedTransaction(
+        amount=Decimal("100"), type="expense", category="Продукты",
+        items=[ReceiptItem(name="товар", amount=Decimal("100"), item_discount=Decimal("20"), category="Продукты")],
+    )
+
+    async def initial(*_args, **_kwargs):
+        return first
+
+    async def repair(content, *_args, **_kwargs):
+        assert "Предыдущий черновик" in content[0]["text"]
+        assert "120" in content[0]["text"]
+        return repaired
+
+    monkeypatch.setattr(parser, "parse_images", initial)
+    monkeypatch.setattr(parser, "_parse", repair)
+
+    result = await parser.parse_receipt_images([(b"image", "image/jpeg")], ["Продукты"], object())
+
+    assert result == repaired
+    assert receipt_totals_match(result)
