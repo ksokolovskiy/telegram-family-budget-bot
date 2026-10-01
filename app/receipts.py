@@ -13,9 +13,9 @@ MAX_RECEIPT_BYTES = 10 * 1024 * 1024
 MAX_URL_LENGTH = 2_048
 MAX_REDIRECTS = 4
 MAX_PDF_PAGES = 5
-# Kept off while the dynamic web-receipt renderer is being stabilized. The
-# implementation remains in this module and can be enabled without a rewrite.
-ENABLE_RECEIPT_URLS = False
+# Public receipt links are enabled in production.  The URL fetcher validates
+# redirects and rejects private-network destinations before downloading data.
+ENABLE_RECEIPT_URLS = True
 
 
 class ReceiptError(ValueError):
