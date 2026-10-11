@@ -142,9 +142,9 @@ def test_discount_audit_requires_explicit_corrections_to_balance_a_receipt():
         ],
     )
     audit = DiscountAudit(corrections=[
-        DiscountAuditEntry(operation="apply_discount", item_index=0, amount=Decimal("4"), source_line="−4.00"),
-        DiscountAuditEntry(operation="remove_duplicate", item_index=1, amount=Decimal("0"), source_line="−4.00"),
-        DiscountAuditEntry(operation="remove_fully_discounted", item_index=2, amount=Decimal("0"), source_line="−5.90"),
+        DiscountAuditEntry(operation="apply_discount", item_indexes=[0], amount=Decimal("4"), source_line="−4.00"),
+        DiscountAuditEntry(operation="remove_duplicate", item_indexes=[1], amount=Decimal("0"), source_line="−4.00"),
+        DiscountAuditEntry(operation="remove_fully_discounted", item_indexes=[2], amount=Decimal("0"), source_line="−5.90"),
     ])
 
     corrected = apply_discount_audit(parsed, audit)
@@ -152,6 +152,39 @@ def test_discount_audit_requires_explicit_corrections_to_balance_a_receipt():
     assert corrected is not None
     assert [(item.name, item.amount, item.item_discount) for item in corrected.items] == [
         ("сосиски", Decimal("12.9"), Decimal("4")),
+    ]
+    assert receipt_totals_match(corrected)
+
+
+def test_discount_audit_moves_one_reused_coupon_to_receipt_and_removes_net_price_duplicate():
+    parsed = ParsedTransaction(
+        amount=Decimal("703"), type="expense", category="Продукты",
+        items=[
+            ReceiptItem(name="прочее", amount=Decimal("681.2"), category="Продукты"),
+            ReceiptItem(name="бисквит 1", amount=Decimal("2"), item_discount=Decimal("5.9"), category="Продукты"),
+            ReceiptItem(name="бисквит 2", amount=Decimal("2"), item_discount=Decimal("5.9"), category="Продукты"),
+            ReceiptItem(name="сосиски", amount=Decimal("15.9"), category="Продукты"),
+            ReceiptItem(name="сосиски после скидки", amount=Decimal("12.9"), item_discount=Decimal("4"), category="Продукты"),
+        ],
+    )
+    audit = DiscountAudit(corrections=[
+        DiscountAuditEntry(
+            operation="move_reused_discount_to_receipt", item_indexes=[1, 2],
+            amount=Decimal("5.9"), source_line="−5.90",
+        ),
+        DiscountAuditEntry(operation="apply_discount", item_indexes=[3], amount=Decimal("4"), source_line="−4.00"),
+        DiscountAuditEntry(operation="remove_duplicate", item_indexes=[4], amount=Decimal("0"), source_line="−4.00"),
+    ])
+
+    corrected = apply_discount_audit(parsed, audit)
+
+    assert corrected is not None
+    assert corrected.receipt_discount == Decimal("5.9")
+    assert [(item.name, item.amount, item.item_discount) for item in corrected.items] == [
+        ("прочее", Decimal("681.2"), Decimal("0")),
+        ("бисквит 1", Decimal("7.9"), Decimal("0")),
+        ("бисквит 2", Decimal("7.9"), Decimal("0")),
+        ("сосиски", Decimal("11.9"), Decimal("4")),
     ]
     assert receipt_totals_match(corrected)
 

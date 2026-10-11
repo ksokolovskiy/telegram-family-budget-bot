@@ -28,14 +28,20 @@ SYSTEM_PROMPT = """Вы — строго структурированный мо
 способ оплаты, сдачу, итог или строку скидки.
 
 Отрицательная строка рядом с товаром или строка акции — это важный факт, а не
-строка, которую можно пропустить. Свяжите её с товаром/товарами, к которым она
-относится. Для item укажите amount после такой скидки, а item_discount — полную
-сумму скидки этого товара. Если скидка распространяется на несколько явно
-указанных товаров, распределите её между ними без потери копеек. Если скидка
-напечатана на ВЕСЬ чек и её нельзя отнести к товарам, укажите её в
-receipt_discount. При этом сумма всех items минус receipt_discount обязана
-равняться напечатанному итогу с точностью до одной агоры. Не придумывайте скидку:
-используйте только отрицательные строки и условия акций, напечатанные на чеке.
+строка, которую можно пропустить. Свяжите её с товаром только если это
+подтверждается названием, штрихкодом или условием акции на той же строке. Каждая
+напечатанная отрицательная строка может быть учтена РОВНО ОДИН РАЗ: нельзя
+применять одну скидку к двум одинаковым товарам только потому, что они стоят
+рядом. Если у отрицательной строки нет однозначной положительной товарной строки
+(например, купон или подарок со своим названием), учитывайте её один раз в
+receipt_discount. Для item укажите amount после связанной скидки, а
+item_discount — полную сумму скидки этого товара. Результат вычитания не является
+новой товарной строкой: не создавайте отдельный item с ценой «после скидки», если
+такой положительной строки на чеке нет. Если скидка распространяется на несколько
+явно указанных товаров, распределите её между ними без потери копеек. При этом
+сумма всех items минус receipt_discount обязана равняться напечатанному итогу с
+точностью до одной агоры. Не придумывайте скидку: используйте только отрицательные
+строки и условия акций, напечатанные на чеке.
 
 Если приложено несколько изображений, они могут быть перекрывающимися частями
 одного длинного чека. Рассматривайте их как последовательность страниц: строка,
@@ -97,18 +103,34 @@ class ParsedTransaction(BaseModel):
 class DiscountAuditEntry(BaseModel):
     """One evidence-backed correction found on the original receipt image."""
 
-    operation: Literal["apply_discount", "remove_duplicate", "remove_fully_discounted"]
-    item_index: int = Field(ge=0)
+    operation: Literal[
+        "apply_discount",
+        "remove_duplicate",
+        "remove_fully_discounted",
+        "move_reused_discount_to_receipt",
+    ]
+    item_indexes: list[int] = Field(min_length=1)
     amount: Decimal = Field(ge=0)
     source_line: str = Field(min_length=1, max_length=240)
 
     @field_validator("amount")
     @classmethod
     def require_discount_amount(cls, value: Decimal, info) -> Decimal:
-        if info.data.get("operation") == "apply_discount" and value <= 0:
+        operation = info.data.get("operation")
+        if operation in {"apply_discount", "move_reused_discount_to_receipt"} and value <= 0:
             raise ValueError("apply_discount requires a positive amount")
-        if info.data.get("operation") in {"remove_duplicate", "remove_fully_discounted"} and value != 0:
+        if operation in {"remove_duplicate", "remove_fully_discounted"} and value != 0:
             raise ValueError("remove operations require a zero amount")
+        return value
+
+    @field_validator("item_indexes")
+    @classmethod
+    def validate_indexes(cls, value: list[int], info) -> list[int]:
+        if any(index < 0 for index in value) or len(set(value)) != len(value):
+            raise ValueError("item indexes must be unique non-negative integers")
+        operation = info.data.get("operation")
+        if operation != "move_reused_discount_to_receipt" and len(value) != 1:
+            raise ValueError("this operation requires exactly one item index")
         return value
 
 
@@ -149,12 +171,12 @@ def discount_audit_response_format() -> dict[str, Any]:
     correction = {
         "type": "object", "additionalProperties": False,
         "properties": {
-            "operation": {"type": "string", "enum": ["apply_discount", "remove_duplicate", "remove_fully_discounted"]},
-            "item_index": {"type": "integer", "minimum": 0},
+            "operation": {"type": "string", "enum": ["apply_discount", "remove_duplicate", "remove_fully_discounted", "move_reused_discount_to_receipt"]},
+            "item_indexes": {"type": "array", "minItems": 1, "items": {"type": "integer", "minimum": 0}},
             "amount": {"type": "number", "minimum": 0},
             "source_line": {"type": "string"},
         },
-        "required": ["operation", "item_index", "amount", "source_line"],
+        "required": ["operation", "item_indexes", "amount", "source_line"],
     }
     return {
         "type": "json_schema",
@@ -179,20 +201,38 @@ def apply_discount_audit(parsed: ParsedTransaction, audit: DiscountAudit) -> Par
     """
     items = list(parsed.items)
     removed: set[int] = set()
+    receipt_discount = parsed.receipt_discount
     for correction in audit.corrections:
-        if correction.item_index >= len(items) or correction.item_index in removed:
+        if any(index >= len(items) or index in removed for index in correction.item_indexes):
             return None
-        item = items[correction.item_index]
         if correction.operation in {"remove_duplicate", "remove_fully_discounted"}:
-            removed.add(correction.item_index)
+            removed.add(correction.item_indexes[0])
             continue
+        if correction.operation == "move_reused_discount_to_receipt":
+            # A single printed coupon was incorrectly applied to several items.
+            # Restore each affected line and deduct that coupon once globally.
+            for index in correction.item_indexes:
+                item = items[index]
+                if item.item_discount < correction.amount:
+                    return None
+                items[index] = item.model_copy(update={
+                    "amount": item.amount + correction.amount,
+                    "item_discount": item.item_discount - correction.amount,
+                })
+            receipt_discount += correction.amount
+            continue
+        item_index = correction.item_indexes[0]
+        item = items[item_index]
         amount = item.amount - correction.amount
         if amount <= 0:
             return None
-        items[correction.item_index] = item.model_copy(
+        items[item_index] = item.model_copy(
             update={"amount": amount, "item_discount": item.item_discount + correction.amount}
         )
-    corrected = parsed.model_copy(update={"items": [item for index, item in enumerate(items) if index not in removed]})
+    corrected = parsed.model_copy(update={
+        "items": [item for index, item in enumerate(items) if index not in removed],
+        "receipt_discount": receipt_discount,
+    })
     return corrected if corrected.items and receipt_totals_match(corrected) else None
 
 
@@ -391,14 +431,20 @@ class AIParser:
                 f"{parsed.amount}; сумма уже распознанных позиций минус скидка чека: "
                 f"{sum((item.amount for item in parsed.items), Decimal('0')) - parsed.receipt_discount}.\n\n"
                 "Ниже дан пронумерованный черновик позиций. Верните ТОЛЬКО доказуемые "
-                "исправления по исходным фото. Для каждой напечатанной отрицательной "
-                "строки скидки, которая относится к товару, используйте apply_discount "
-                "и укажите индекс исходного товара. Если черновик содержит товар дважды: "
-                "исходную цену и отдельную строку цены после той же скидки, используйте "
-                "apply_discount для исходной цены и remove_duplicate для второй строки. "
-                "Если скидка полностью обнуляет отдельный товар, используйте "
-                "remove_fully_discounted. Для remove_duplicate и remove_fully_discounted "
-                "amount всегда 0. source_line должен содержать "
+                "исправления по исходным фото. Одна напечатанная отрицательная строка "
+                "может быть использована ровно один раз — одинаковые товары рядом не "
+                "дают права повторить скидку. Для каждой отрицательной строки, которая "
+                "однозначно относится к товару, используйте apply_discount и укажите "
+                "единственный индекс исходного товара. Если черновик содержит товар "
+                "дважды: исходную цену и отдельную выдуманную строку цены после той же "
+                "скидки, используйте apply_discount для исходной цены и remove_duplicate "
+                "для второй строки. Если одну скидку ошибочно применили к нескольким "
+                "позициям, хотя на чеке это один отдельный купон/подарок без однозначной "
+                "положительной пары, используйте move_reused_discount_to_receipt с "
+                "индексами всех таких позиций: это восстановит их цены и вычтет скидку "
+                "один раз из всего чека. Если скидка полностью обнуляет отдельный товар, "
+                "используйте remove_fully_discounted. Для remove_duplicate и "
+                "remove_fully_discounted amount всегда 0. source_line должен содержать "
                 "узнаваемый фрагмент напечатанной отрицательной строки. Не добавляйте "
                 "операции, если не можете показать такую строку на фото.\n\n"
                 f"Черновик: {json.dumps(indexed_items, ensure_ascii=False)}"
