@@ -2,9 +2,12 @@ from decimal import Decimal
 
 from app.ai import (
     AIParser,
+    DiscountAudit,
+    DiscountAuditEntry,
     ParsedTransaction,
     ReceiptItem,
     SYSTEM_PROMPT,
+    apply_discount_audit,
     discard_zero_amount_receipt_items,
     fallback_parse_text,
     reconcile_receipt_totals,
@@ -129,6 +132,30 @@ def test_large_receipt_discrepancy_is_not_auto_corrected():
     assert len(result.items) == 1
 
 
+def test_discount_audit_requires_explicit_corrections_to_balance_a_receipt():
+    parsed = ParsedTransaction(
+        amount=Decimal("12.9"), type="expense", category="Продукты",
+        items=[
+            ReceiptItem(name="сосиски", amount=Decimal("16.9"), category="Продукты"),
+            ReceiptItem(name="сосиски после скидки", amount=Decimal("12.9"), category="Продукты"),
+            ReceiptItem(name="акционный товар", amount=Decimal("5.9"), category="Продукты"),
+        ],
+    )
+    audit = DiscountAudit(corrections=[
+        DiscountAuditEntry(operation="apply_discount", item_index=0, amount=Decimal("4"), source_line="−4.00"),
+        DiscountAuditEntry(operation="remove_duplicate", item_index=1, amount=Decimal("0"), source_line="−4.00"),
+        DiscountAuditEntry(operation="remove_fully_discounted", item_index=2, amount=Decimal("0"), source_line="−5.90"),
+    ])
+
+    corrected = apply_discount_audit(parsed, audit)
+
+    assert corrected is not None
+    assert [(item.name, item.amount, item.item_discount) for item in corrected.items] == [
+        ("сосиски", Decimal("12.9"), Decimal("4")),
+    ]
+    assert receipt_totals_match(corrected)
+
+
 def test_unbalanced_receipt_is_never_rendered_as_actionable_draft():
     html = draft_html(
         "token", Decimal("100"), "expense", "Дом", None,
@@ -162,6 +189,11 @@ async def test_receipt_parser_repairs_a_large_mismatch_before_returning_a_draft(
 
     monkeypatch.setattr(parser, "parse_images", initial)
     monkeypatch.setattr(parser, "_parse", repair)
+
+    async def no_audit(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(parser, "_audit_discounts", no_audit)
 
     result = await parser.parse_receipt_images([(b"image", "image/jpeg")], ["Продукты"], object())
 

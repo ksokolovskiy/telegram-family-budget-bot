@@ -5,7 +5,7 @@ import json
 import logging
 import re
 from decimal import Decimal, InvalidOperation
-from typing import Any
+from typing import Any, Literal
 
 from openai import AsyncOpenAI, RateLimitError
 from pydantic import BaseModel, Field, ValidationError, field_validator
@@ -94,6 +94,28 @@ class ParsedTransaction(BaseModel):
         return value
 
 
+class DiscountAuditEntry(BaseModel):
+    """One evidence-backed correction found on the original receipt image."""
+
+    operation: Literal["apply_discount", "remove_duplicate", "remove_fully_discounted"]
+    item_index: int = Field(ge=0)
+    amount: Decimal = Field(ge=0)
+    source_line: str = Field(min_length=1, max_length=240)
+
+    @field_validator("amount")
+    @classmethod
+    def require_discount_amount(cls, value: Decimal, info) -> Decimal:
+        if info.data.get("operation") == "apply_discount" and value <= 0:
+            raise ValueError("apply_discount requires a positive amount")
+        if info.data.get("operation") in {"remove_duplicate", "remove_fully_discounted"} and value != 0:
+            raise ValueError("remove operations require a zero amount")
+        return value
+
+
+class DiscountAudit(BaseModel):
+    corrections: list[DiscountAuditEntry] = Field(default_factory=list)
+
+
 def receipt_response_format(categories: list[str]) -> dict[str, Any]:
     """Strict provider schema: JSON mode alone only promises valid JSON."""
     choices = list(dict.fromkeys(categories)) or ["Другое"]
@@ -120,6 +142,58 @@ def receipt_response_format(categories: list[str]) -> dict[str, Any]:
             },
         },
     }
+
+
+def discount_audit_response_format() -> dict[str, Any]:
+    """Schema for a narrow, evidence-backed receipt discount audit."""
+    correction = {
+        "type": "object", "additionalProperties": False,
+        "properties": {
+            "operation": {"type": "string", "enum": ["apply_discount", "remove_duplicate", "remove_fully_discounted"]},
+            "item_index": {"type": "integer", "minimum": 0},
+            "amount": {"type": "number", "minimum": 0},
+            "source_line": {"type": "string"},
+        },
+        "required": ["operation", "item_index", "amount", "source_line"],
+    }
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "receipt_discount_audit", "strict": True,
+            "schema": {
+                "type": "object", "additionalProperties": False,
+                "properties": {"corrections": {"type": "array", "items": correction}},
+                "required": ["corrections"],
+            },
+        },
+    }
+
+
+def apply_discount_audit(parsed: ParsedTransaction, audit: DiscountAudit) -> ParsedTransaction | None:
+    """Apply only explicit audit corrections and require an exact final total.
+
+    The audit may reduce a recognised item by a printed negative line, or
+    remove a duplicate net-price row created from that same line.  It never
+    inserts a balancing amount or turns an unexplained difference into a
+    receipt-wide discount.
+    """
+    items = list(parsed.items)
+    removed: set[int] = set()
+    for correction in audit.corrections:
+        if correction.item_index >= len(items) or correction.item_index in removed:
+            return None
+        item = items[correction.item_index]
+        if correction.operation in {"remove_duplicate", "remove_fully_discounted"}:
+            removed.add(correction.item_index)
+            continue
+        amount = item.amount - correction.amount
+        if amount <= 0:
+            return None
+        items[correction.item_index] = item.model_copy(
+            update={"amount": amount, "item_discount": item.item_discount + correction.amount}
+        )
+    corrected = parsed.model_copy(update={"items": [item for index, item in enumerate(items) if index not in removed]})
+    return corrected if corrected.items and receipt_totals_match(corrected) else None
 
 
 def discard_zero_amount_receipt_items(payload: Any) -> Any:
@@ -257,6 +331,10 @@ class AIParser:
             return parsed
 
         assert parsed is not None  # guarded by receipt_totals_match above
+        audited = await self._audit_discounts(images, parsed, runtime)
+        if audited:
+            return audited
+
         original = parsed.model_dump(mode="json")
         item_total = sum((item.amount for item in parsed.items), Decimal("0"))
         repair_content: list[dict[str, Any]] = [{
@@ -279,9 +357,70 @@ class AIParser:
             data_url = f"data:{mime_type};base64,{base64.b64encode(image_bytes).decode('ascii')}"
             repair_content.append({"type": "image_url", "image_url": {"url": data_url, "detail": "high"}})
         repaired = reconcile_receipt_totals(await self._parse(repair_content, categories, runtime))
+        if repaired and not receipt_totals_match(repaired):
+            audited = await self._audit_discounts(images, repaired, runtime)
+            if audited:
+                return audited
         # A provider failure on the repair pass must not discard the original:
         # it remains a safe, non-actionable draft with a retry action.
         return repaired or parsed
+
+    async def _audit_discounts(
+        self,
+        images: list[tuple[bytes, str]],
+        parsed: ParsedTransaction,
+        runtime: FamilyAISettings,
+    ) -> ParsedTransaction | None:
+        """Ask for only evidence-backed discount corrections after a mismatch."""
+        client = self._client_for(runtime)
+        if client is None:
+            return None
+        indexed_items = [
+            {
+                "index": index,
+                "name": item.name,
+                "amount_after_known_discounts": str(item.amount),
+                "known_item_discount": str(item.item_discount),
+            }
+            for index, item in enumerate(parsed.items)
+        ]
+        content: list[dict[str, Any]] = [{
+            "type": "text",
+            "text": (
+                "Проведите аудит скидок на чеке. Финальный итог чека: "
+                f"{parsed.amount}; сумма уже распознанных позиций минус скидка чека: "
+                f"{sum((item.amount for item in parsed.items), Decimal('0')) - parsed.receipt_discount}.\n\n"
+                "Ниже дан пронумерованный черновик позиций. Верните ТОЛЬКО доказуемые "
+                "исправления по исходным фото. Для каждой напечатанной отрицательной "
+                "строки скидки, которая относится к товару, используйте apply_discount "
+                "и укажите индекс исходного товара. Если черновик содержит товар дважды: "
+                "исходную цену и отдельную строку цены после той же скидки, используйте "
+                "apply_discount для исходной цены и remove_duplicate для второй строки. "
+                "Если скидка полностью обнуляет отдельный товар, используйте "
+                "remove_fully_discounted. Для remove_duplicate и remove_fully_discounted "
+                "amount всегда 0. source_line должен содержать "
+                "узнаваемый фрагмент напечатанной отрицательной строки. Не добавляйте "
+                "операции, если не можете показать такую строку на фото.\n\n"
+                f"Черновик: {json.dumps(indexed_items, ensure_ascii=False)}"
+            ),
+        }]
+        for image_bytes, mime_type in images:
+            data_url = f"data:{mime_type};base64,{base64.b64encode(image_bytes).decode('ascii')}"
+            content.append({"type": "image_url", "image_url": {"url": data_url, "detail": "high"}})
+        try:
+            response = await client.chat.completions.create(
+                model=runtime.openai_model,
+                messages=[{"role": "user", "content": content}],
+                response_format=discount_audit_response_format(),
+            )
+            raw = response.choices[0].message.content or "{}"
+            return apply_discount_audit(parsed, DiscountAudit.model_validate(json.loads(raw)))
+        except (json.JSONDecodeError, ValidationError) as error:
+            logger.warning("OpenAI returned an invalid receipt discount audit: %s", error)
+            return None
+        except Exception:
+            logger.exception("OpenAI receipt discount audit request failed")
+            return None
 
     async def _parse(self, content: list[dict[str, Any]], categories: list[str], runtime: FamilyAISettings) -> ParsedTransaction | None:
         # Keep a local reference. Another family's simultaneous request may
