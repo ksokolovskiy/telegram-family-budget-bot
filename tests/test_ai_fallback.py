@@ -5,8 +5,10 @@ from app.ai import (
     ParsedTransaction,
     ReceiptItem,
     SYSTEM_PROMPT,
+    discard_zero_amount_receipt_items,
     fallback_parse_text,
     reconcile_receipt_totals,
+    receipt_response_format,
     receipt_totals_match,
 )
 from app.rich_bot import draft_html, inline_payment_parts, normalize_text_comment
@@ -16,6 +18,32 @@ def test_system_prompt_replaces_categories_without_interpreting_json_braces():
     prompt = SYSTEM_PROMPT.replace("{categories_list}", "Продукты, Авто")
     assert "Продукты, Авто" in prompt
     assert '"amount"' in prompt
+
+
+def test_receipt_schema_requires_positive_item_amounts():
+    schema = receipt_response_format(["Продукты"])
+    item_amount = schema["json_schema"]["schema"]["properties"]["items"]["items"]["properties"]["amount"]
+
+    assert item_amount["exclusiveMinimum"] == 0
+
+
+def test_zero_amount_technical_receipt_lines_are_discarded_before_validation():
+    payload = {
+        "amount": 10,
+        "type": "expense",
+        "category": "Продукты",
+        "comment": None,
+        "receipt_discount": 0,
+        "items": [
+            {"name": "Корректировка веса", "amount": 0, "item_discount": 0, "category": "Продукты"},
+            {"name": "Молоко", "amount": 10, "item_discount": 0, "category": "Продукты"},
+        ],
+    }
+
+    parsed = ParsedTransaction.model_validate(discard_zero_amount_receipt_items(payload))
+
+    assert [item.name for item in parsed.items] == ["Молоко"]
+    assert receipt_totals_match(parsed)
 
 
 def test_fallback_parse_expense():

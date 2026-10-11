@@ -63,6 +63,8 @@ items ровно один раз.
 чек. item_discount — скидка, относящаяся только к этой позиции (или 0).
 receipt_discount — только общая скидка на весь чек (или 0); не включайте её в
 amount позиций. Для обычного текста верните пустой массив и receipt_discount 0.
+Не добавляйте в items технические строки с суммой 0 (например, строки тары,
+корректировки веса или полностью компенсированной скидки): это не товары.
 Особенно тщательно отличайте продукты питания и напитки от товаров для дома:
 если в категориях семьи есть «Продукты», отнесите туда еду, напитки и продукты
 питания, даже если остальные позиции того же чека относятся к «Дом».
@@ -98,7 +100,7 @@ def receipt_response_format(categories: list[str]) -> dict[str, Any]:
     item = {
         "type": "object", "additionalProperties": False,
         "properties": {
-            "name": {"type": "string"}, "amount": {"type": "number"},
+            "name": {"type": "string"}, "amount": {"type": "number", "exclusiveMinimum": 0},
             "item_discount": {"type": "number"}, "category": {"type": "string", "enum": choices},
         },
         "required": ["name", "amount", "item_discount", "category"],
@@ -118,6 +120,36 @@ def receipt_response_format(categories: list[str]) -> dict[str, Any]:
             },
         },
     }
+
+
+def discard_zero_amount_receipt_items(payload: Any) -> Any:
+    """Discard harmless zero-value technical rows before strict validation.
+
+    Vision models sometimes turn a receipt's tare or weight-adjustment line
+    into an item with amount 0.  Such a row cannot affect the receipt total,
+    but previously made Pydantic reject an otherwise valid whole receipt.
+    Keep malformed and negative values intact so validation still exposes real
+    extraction errors instead of silently changing financial data.
+    """
+    if not isinstance(payload, dict) or not isinstance(payload.get("items"), list):
+        return payload
+
+    items: list[Any] = []
+    discarded = 0
+    for item in payload["items"]:
+        if isinstance(item, dict):
+            try:
+                is_zero = Decimal(str(item.get("amount"))) == Decimal("0")
+            except (InvalidOperation, ValueError):
+                is_zero = False
+            if is_zero:
+                discarded += 1
+                continue
+        items.append(item)
+    if discarded:
+        logger.info("Discarded %d zero-amount technical receipt line(s)", discarded)
+        return {**payload, "items": items}
+    return payload
 
 
 def reconcile_receipt_totals(parsed: ParsedTransaction | None) -> ParsedTransaction | None:
@@ -270,7 +302,7 @@ class AIParser:
                 response_format=receipt_response_format(categories),
             )
             raw = response.choices[0].message.content or "{}"
-            return ParsedTransaction.model_validate(json.loads(raw))
+            return ParsedTransaction.model_validate(discard_zero_amount_receipt_items(json.loads(raw)))
         except RateLimitError as error:
             logger.warning("OpenAI request was rate-limited or has no credit: %s", error)
             raise AIUnavailableError("У OpenAI API key семьи закончился баланс. Пополните API billing и повторите.") from error
