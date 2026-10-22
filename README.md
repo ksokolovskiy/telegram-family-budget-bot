@@ -11,7 +11,7 @@ one place. The user interface is currently Russian-first.
   and a mandatory total check before saving.
 - Invite-only family access, roles, notifications, budgets, recurring operations, and
   expandable rich Telegram reports.
-- Per-family OpenAI key and model: every family pays for its own AI usage.
+- Per-family Google/OpenAI provider, model and encrypted keys: every family pays for its own AI usage. Switching providers retains both configurations.
 - FX conversion through Frankfurter v2; the rate, date, and source stay with the
   operation.
 
@@ -19,7 +19,7 @@ one place. The user interface is currently Russian-first.
 
 - **bot** — Telegram interaction and rich messages;
 - **worker** — recurring operations, receipt cleanup, and FX refresh;
-- **PostgreSQL** — application data, settings, and encrypted family OpenAI keys.
+- **PostgreSQL** — application data, settings, and encrypted family AI keys.
 
 The local compose file starts PostgreSQL. Production expects PostgreSQL supplied by
 the deployment environment.
@@ -42,7 +42,7 @@ LOCAL_POSTGRES_USER=budget
 LOCAL_POSTGRES_PASSWORD=replace_with_a_random_alphanumeric_password
 ```
 
-Then run `docker compose up --build`. After `/start`, open **Settings** to configure the OpenAI key and model for the
+Then run `docker compose up --build`. After `/start`, open `/family` to configure the AI provider, key and model for the
 family. `BOT_TOKEN` and `OWNER_TELEGRAM_ID` are deployment-only; other product
 settings live in the bot. Local Compose builds its database connection internally.
 
@@ -116,13 +116,27 @@ Do not deploy this pipeline without a successful representative comparison.
 
 Rotating `BOT_TOKEN` changes the encryption key: retain the old token securely
 until family keys have been migrated, or have each family owner re-enter their
-OpenAI key after rotation. Receipt files are sent to OpenAI for processing; Telegram
+provider keys after rotation. Receipt files are sent to the selected Google/OpenAI provider for processing; Telegram
 file identifiers are retained according to the configured retention policy.
 
 ## Security and privacy
 
+### Receipt processing and provider settings
+
+In `/family`, the owner selects Google or OpenAI, enters that provider's API key,
+and selects a model from the provider's paginated model list. Each provider keeps
+its own key and model when switching. Google requires the Gemini Developer API
+(`generativelanguage.googleapis.com`); a Vision-only key is insufficient.
+
+Receipts are processed in original language: OCR, arithmetic validation,
+classification and discount allocation. Product names are not translated.
+One rich progress message displays the current stage and elapsed time, including
+on retries from drafts or saved operations. A failed progress edit does not
+discard the recognition result. Monetary validation never invents a balancing
+adjustment. Review the draft before saving, especially items marked uncertain.
+
 - Never commit `.env`, database exports, receipts, or production logs.
-- The OpenAI key is stored per family and encrypted at rest.
+- Each provider key is stored per family and encrypted at rest with family/provider-specific key derivation.
 - An exported database alone does not expose family keys. An attacker with both the
   database and deployment bot token could decrypt them; protect and rotate that token.
 - Receipt images may be sent to the family-selected AI provider for recognition.

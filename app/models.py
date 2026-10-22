@@ -51,6 +51,10 @@ class Family(Base):
     openai_api_key_encryption_version: Mapped[str | None] = mapped_column(String(32))
     openai_api_key_encrypted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     openai_model: Mapped[str] = mapped_column(String(120), default="gpt-5.4", server_default="gpt-5.4")
+    ai_provider: Mapped[str] = mapped_column(String(16), default="openai", server_default="openai")
+    google_api_key: Mapped[str | None] = mapped_column(Text())
+    google_api_key_encryption_version: Mapped[str | None] = mapped_column(String(32))
+    google_model: Mapped[str] = mapped_column(String(120), default="gemini-4-argon", server_default="gemini-4-argon")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     users: Mapped[list[User]] = relationship(back_populates="family")

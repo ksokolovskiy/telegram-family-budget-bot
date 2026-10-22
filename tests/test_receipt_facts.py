@@ -116,13 +116,13 @@ async def test_public_parser_uses_fact_pipeline(monkeypatch):
     from app.settings_store import FamilyAISettings
     expected = ParsedTransaction(amount='1', type='expense', category='Продукты')
     recognize_mock = AsyncMock(return_value=expected)
-    monkeypatch.setattr('app.receipt_facts.recognize', recognize_mock)
+    monkeypatch.setattr('app.receipt_argon.recognize', recognize_mock)
     parser = AIParser()
     client = object()
     monkeypatch.setattr(parser, '_client_for', lambda runtime: client)
     runtime = FamilyAISettings(openai_api_key=None, openai_model='test')
     assert await parser.parse_receipt_images([], ['Продукты'], runtime) is expected
-    recognize_mock.assert_awaited_once_with(client, 'test', [], ['Продукты'], None)
+    recognize_mock.assert_awaited_once_with(client, 'test', [], ['Продукты'], None, None)
 
 
 @pytest.mark.parametrize('labels', [
@@ -179,13 +179,14 @@ async def test_translation_never_enters_classification(display_translation):
     assert item.name == 'מגבונים'
     assert item.source_text == 'מגבונים 9.50'
     assert item.category == 'Дом'
-    assert item.display_name == 'Ошибочный перевод: орехи'
+    assert item.display_name is None
+    display_translation.assert_not_awaited()
     prompt = create.call_args.kwargs['messages'][0]['content'][0]['text']
     assert 'מגבונים' in prompt
     assert 'Ошибочный перевод' not in prompt
     from app.rich_bot import receipt_category_groups, receipt_item_display_name
     assert receipt_category_groups(parsed.items)[0]['names'] == ['מגבונים']
-    assert 'Ошибочный перевод' in receipt_item_display_name(item)
+    assert receipt_item_display_name(item) == 'מגבונים'
 
 
 @pytest.mark.parametrize('payload', ['{}', '{"names":[{"id":1,"text":"Орехи"},{"id":1,"text":"Орехи"}]}'])

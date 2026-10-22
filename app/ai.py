@@ -19,6 +19,7 @@ class AIUnavailableError(RuntimeError):
     """A user-actionable provider failure, safe to show in Telegram."""
 
 SYSTEM_PROMPT = """Вы — строго структурированный модуль классификации расходов для финансового Telegram-бота.
+Названия товаров копируйте в оригинале. Не переводите их на русский и не додумывайте сокращения.
 Вам на вход поступает текстовое сообщение от пользователя или изображение (чек/скриншот), а также список существующих категорий этой семьи: {categories_list}.
 
 Сначала извлеките факты, затем классифицируйте. Сумма amount — только напечатанный
@@ -320,6 +321,9 @@ class AIParser:
 
     def _client_for(self, runtime: FamilyAISettings) -> AsyncOpenAI | None:
         """Recreate only when a family owner changes that family's key."""
+        if runtime.provider == "google":
+            from app.google_ai import GoogleClient
+            return GoogleClient(runtime.api_key, runtime.model) if runtime.api_key else None
         if not runtime.openai_api_key:
             self.client = None
             self._api_key = None
@@ -338,37 +342,26 @@ class AIParser:
         return await self.parse_images([(image_bytes, mime_type)], categories, runtime)
 
     async def parse_images(self, images: list[tuple[bytes, str]], categories: list[str], runtime: FamilyAISettings, native_text: str | None = None) -> ParsedTransaction | None:
-        if not self._client_for(runtime):
-            return None
-        content: list[dict[str, Any]] = [{
-            "type": "text",
-            "text": "Распознай чек. Верни одну отдельную позицию items для каждой строки товара на чеке, даже если категории совпадают; не суммируй и не группируй товары.",
-        }]
-        if native_text:
-            content.append({"type": "text", "text": "Ниже точный текстовый слой PDF. Используй его как основной источник названий и сумм; изображение — для проверки расположения и отсутствующих символов.\n\n" + native_text})
-        for image_bytes, mime_type in images:
-            data_url = f"data:{mime_type};base64,{base64.b64encode(image_bytes).decode('ascii')}"
-            content.append({"type": "image_url", "image_url": {"url": data_url, "detail": "high"}})
-        return await self._parse(
-            content,
-            categories, runtime,
-        )
+        return await self.parse_receipt_images(images, categories, runtime, native_text)
 
-    async def parse_receipt_images(self, images, categories, runtime, native_text=None):
-        from app.receipt_facts import recognize
+    async def parse_receipt_images(self, images, categories, runtime, native_text=None, progress=None):
+        from app.receipt_argon import recognize
+        from app.google_ai import GoogleAIError
 
         client = self._client_for(runtime)
         if client is None:
-            return None
+            raise AIUnavailableError("Задайте API key выбранного провайдера в настройках семьи.")
         try:
-            return await recognize(client, runtime.openai_model, images, categories, native_text)
+            return await recognize(client, runtime.model, images, categories, native_text, progress)
+        except GoogleAIError as error:
+            raise AIUnavailableError(str(error)) from error
         except RateLimitError as error:
             raise AIUnavailableError("OpenAI отклонил запрос по лимиту. Проверьте баланс и повторите.") from error
         except APIError as error:
             raise AIUnavailableError(
                 "OpenAI не завершил распознавание. Чек не записан. Повторите отправку чека."
             ) from error
-        except (ValueError, KeyError) as error:
+        except (ValueError, KeyError, TypeError, ArithmeticError) as error:
             raise AIUnavailableError(
                 "Не удалось сверить строки чека после повторной проверки. "
                 "Чек не записан. Пришлите все фото или PDF ещё раз для повторного распознавания."

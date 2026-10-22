@@ -6,7 +6,7 @@ deployment secrets/identity anchors and remain environment-only.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import base64
 import re
@@ -50,8 +50,19 @@ class RuntimeSettings:
 
 @dataclass(frozen=True)
 class FamilyAISettings:
-    openai_api_key: str | None
+    openai_api_key: str | None = field(repr=False)
     openai_model: str
+    provider: str = "openai"
+    google_api_key: str | None = field(default=None, repr=False)
+    google_model: str = "gemini-4-argon"
+
+    @property
+    def api_key(self):
+        return self.google_api_key if self.provider == "google" else self.openai_api_key
+
+    @property
+    def model(self):
+        return self.google_model if self.provider == "google" else self.openai_model
 
 
 async def get_values(session: AsyncSession) -> dict[str, str]:
@@ -81,7 +92,35 @@ async def get_family_ai_settings(session: AsyncSession, family_id: int) -> Famil
         key = decrypt_family_openai_api_key(
             family.openai_api_key, family.openai_api_key_encryption_version, family.id
         )
-    return FamilyAISettings(openai_api_key=key, openai_model=family.openai_model)
+    google_key = None
+    if family.google_api_key:
+        if family.google_api_key_encryption_version != ENCRYPTION_VERSION:
+            raise RuntimeError("Неподдерживаемая версия шифрования ключа Google.")
+        try:
+            google_key = _fernet_for_family(family.id, "google").decrypt(family.google_api_key.encode()).decode()
+        except Exception as error:
+            raise RuntimeError("Не удалось расшифровать ключ Google семьи.") from error
+    return FamilyAISettings(key, family.openai_model, family.ai_provider, google_key, family.google_model)
+
+
+async def set_family_ai_key(session, family, provider, value):
+    if provider == "openai":
+        return await set_family_openai_api_key(session, family, value)
+    if provider != "google":
+        raise ValueError("Неизвестный провайдер.")
+    value = value.strip()
+    if not value or len(value) > 512:
+        raise ValueError("Укажите API key длиной до 512 символов.")
+    family.google_api_key = _fernet_for_family(family.id, "google").encrypt(value.encode()).decode()
+    family.google_api_key_encryption_version = ENCRYPTION_VERSION
+
+
+async def set_family_ai_model(session, family, provider, model):
+    if provider == "openai":
+        return await set_family_openai_model(session, family, model)
+    if provider != "google" or not re.fullmatch(r"gemini-[A-Za-z0-9._-]{1,100}", model):
+        raise ValueError("Некорректная модель Google.")
+    family.google_model = model
 
 
 async def set_family_openai_api_key(session: AsyncSession, family: Family, value: str) -> None:
@@ -176,7 +215,7 @@ def decrypt_family_openai_api_key(value: str, version: str, family_id: int) -> s
         raise RuntimeError("Не удалось расшифровать ключ OpenAI семьи. Проверьте BOT_TOKEN.") from error
 
 
-def _fernet_for_family(family_id: int):
+def _fernet_for_family(family_id: int, provider: str = "openai"):
     from app.config import settings
 
     if not settings.bot_token:
@@ -191,7 +230,7 @@ def _fernet_for_family(family_id: int):
         algorithm=hashes.SHA256(),
         length=32,
         salt=_FERNET_SALT,
-        info=f"openai_api_key:family:{family_id}".encode(),
+        info=f"{provider}_api_key:family:{family_id}".encode(),
     ).derive(settings.bot_token.encode("utf-8"))
     return Fernet(base64.urlsafe_b64encode(material))
 

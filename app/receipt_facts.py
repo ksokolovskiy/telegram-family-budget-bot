@@ -214,8 +214,7 @@ async def classify_facts(client, model, facts, images, categories, native_text=N
     by_id = {label['id']: label for label in labels}
     if len(by_id) != len(labels) or set(by_id) != {p.id for p, _, _ in rows}:
         raise ValueError("Incomplete category mapping")
-    display_names = await translate_for_display(client, model, [p for p, _, _ in rows])
-    items = [ReceiptItem(name=p.name, source_text=p.text, display_name=display_names.get(p.id),
+    items = [ReceiptItem(name=p.name, source_text=p.text, display_name=None,
                          amount=net, item_discount=discount,
                          category=by_id[p.id]['category'],
                          category_needs_review=by_id[p.id]['needs_review'])

@@ -41,6 +41,8 @@ from app.repositories import (
     materialize_recurring_transaction, set_receipt_retention_policy, update_family_preferences, upsert_budget,
 )
 from app.rich import RichMessageService, esc, link
+from app.receipt_progress import receipt_progress
+from app.google_ai import GoogleClient
 from app.settings_store import (
     EDITABLE_KEYS,
     HELP as SETTINGS_HELP,
@@ -48,8 +50,8 @@ from app.settings_store import (
     display_value,
     get_family_ai_settings,
     get_values,
-    set_family_openai_api_key,
-    set_family_openai_model,
+    set_family_ai_key,
+    set_family_ai_model,
     set_value,
 )
 
@@ -231,44 +233,41 @@ async def render_settings(bot: Bot, chat_id: int) -> None:
         bot,
         chat_id,
         "<h3>Глобальные настройки приложения</h3>"
-        "<p>Доступны только администратору из .env. Ключ OpenAI и модель задаются владельцем в разделе /family.</p>"
+        "<p>Доступны только администратору из .env. AI-провайдер, ключи и модели задаются владельцем в разделе /family.</p>"
         f"<table><tr><th>Параметр</th><th>Значение</th><th></th></tr>{rows}</table>",
     )
 
 
 async def render_family_model_choices(bot: Bot, chat_id: int, family_id: int, page: int = 0) -> None:
-    """Show only model IDs supplied by this family's OpenAI account."""
+    """Show model IDs supplied by the selected provider for this family."""
     async with SessionLocal() as session:
         runtime = await get_family_ai_settings(session, family_id)
-    if not runtime.openai_api_key:
+    if not runtime.api_key:
         await rich.send(
             bot,
             chat_id,
-            "<p>Сначала задайте <b>OpenAI API key</b> в настройках семьи. После этого бот загрузит доступные у провайдера модели.</p>",
+            "<p>Сначала задайте API key выбранного провайдера в настройках семьи.</p>",
         )
         return
-    client = AsyncOpenAI(api_key=runtime.openai_api_key)
+    client = GoogleClient(runtime.api_key, runtime.model) if runtime.provider == "google" else AsyncOpenAI(api_key=runtime.api_key)
     try:
-        response = await client.models.list()
+        if runtime.provider == "google":
+            model_ids = await client.model_ids()
+        else:
+            response = await client.models.list()
+            model_ids = sorted({m.id for m in response.data if m.id.startswith("gpt-")}, reverse=True)
     except Exception as error:
-        logging.warning("Could not list OpenAI models: %s", error)
-        await rich.send(bot, chat_id, "<p>Не удалось получить модели у провайдера. Проверьте API-ключ и доступ к OpenAI.</p>")
+        logging.warning("Could not list AI models: %s", type(error).__name__)
+        await rich.send(bot, chat_id, "<p>Не удалось получить модели у провайдера. Проверьте API-ключ и доступ.</p>")
         return
     finally:
         await client.close()
 
     # The bot uses image input for receipts via Chat Completions. GPT models are
     # the compatible family; the list itself is never invented or hard-coded.
-    model_ids = sorted(
-        {
-            model.id
-            for model in response.data
-            if model.id.startswith("gpt-") and len(f"family:model:{model.id}") <= 64
-        },
-        reverse=True,
-    )
+    model_ids = [m for m in model_ids if len(f"family:model:{m}") <= 64]
     if not model_ids:
-        await rich.send(bot, chat_id, "<p>Провайдер не вернул совместимых GPT-моделей для обработки чеков.</p>")
+        await rich.send(bot, chat_id, "<p>Провайдер не вернул совместимых моделей для обработки чеков.</p>")
         return
     page_size = 20
     page_count = max(1, (len(model_ids) + page_size - 1) // page_size)
@@ -290,7 +289,7 @@ async def render_family_model_choices(bot: Bot, chat_id: int, family_id: int, pa
     await rich.send(
         bot,
         chat_id,
-        "<h3>Модель OpenAI семьи</h3><p>Выберите модель, которую вернул аккаунт этой семьи. Для чеков нужна модель с поддержкой изображений.</p>"
+        f"<h3>Модель {esc(runtime.provider)} семьи</h3><p>Выберите модель из списка провайдера. Для чеков нужна поддержка изображений.</p>"
         f"<table><tr><th>Модель</th><th></th></tr>{rows}</table>{pager}",
     )
 
@@ -1285,10 +1284,10 @@ async def receipt_retry(callback: CallbackQuery, bot: Bot) -> None:
         names = [item.name for item in await list_categories(session, user.family_id, "expense")]
         runtime = await get_family_ai_settings(session, user.family_id)
     await callback.answer("Повторно распознаю чек…")
-    file = await bot.get_file(tx.receipt_file_id)
-    content = await bot.download_file(file.file_path)
     try:
-        parsed = await parse_receipt_file(content.read(), tx.receipt_mime_type or "image/jpeg", names, runtime)
+        async with receipt_progress(bot, callback.message.chat.id, rich) as progress:
+            pages = await download_receipt_pages(bot, [(tx.receipt_file_id, tx.receipt_mime_type or "image/jpeg")])
+            parsed = await ai_parser.parse_receipt_images(pages, names, runtime, progress=progress)
     except (ReceiptError, AIUnavailableError) as error:
         await rich.send(bot, callback.message.chat.id, f"<p>{esc(error)}</p>")
         return
@@ -1517,6 +1516,16 @@ async def family_action(callback: CallbackQuery, state: FSMContext, bot: Bot) ->
             family.notify_members_on_transactions = not family.notify_members_on_transactions
             status = "включены" if family.notify_members_on_transactions else "выключены"
         await rich.edit(bot, callback.message.chat.id, callback.message.message_id, f"<p>Уведомления о новых операциях {status}.</p>")
+    elif callback.data.startswith("family:provider:"):
+        provider = callback.data.rsplit(":", 1)[-1]
+        async with SessionLocal() as session, session.begin():
+            user = await session.get(User, callback.from_user.id)
+            family = await session.get(Family, user.family_id) if user and user.family_id else None
+            if not family or user.role != "owner" or provider not in {"google", "openai"}:
+                await callback.answer("Настройка недоступна.", show_alert=True)
+                return
+            family.ai_provider = provider
+        await rich.send(bot, callback.message.chat.id, f"<p>Провайдер: <b>{esc(provider)}</b>. Ключ и модель другого провайдера сохранены.</p><p>{link('family:openai_model', 'Выбрать модель')} · {link(f'family:ai_key:{provider}', 'Изменить ключ')}</p>")
     elif callback.data == "family:openai_model":
         async with SessionLocal() as session:
             user = await session.get(User, callback.from_user.id)
@@ -1541,25 +1550,32 @@ async def family_action(callback: CallbackQuery, state: FSMContext, bot: Bot) ->
                 await callback.answer("Только владелец может менять настройки семьи.", show_alert=True)
                 return
             try:
-                await set_family_openai_model(session, family, model_id)
+                provider = "google" if model_id.startswith("gemini-") else "openai"
+                if family.ai_provider != provider:
+                    raise ValueError("Провайдер изменился. Откройте список моделей заново.")
+                await set_family_ai_model(session, family, provider, model_id)
             except ValueError as error:
                 await callback.answer(str(error), show_alert=True)
                 return
         await rich.send(bot, callback.message.chat.id, f"<p>Модель семьи <code>{esc(model_id)}</code> сохранена.</p>")
-    elif callback.data in {"family:timezone", "family:currency", "family:retention", "family:openai_key"}:
+    elif callback.data in {"family:timezone", "family:currency", "family:retention", "family:openai_key", "family:ai_key:google", "family:ai_key:openai"}:
         async with SessionLocal() as session:
             user = await session.get(User, callback.from_user.id)
         if not user or user.role != "owner" or not user.family_id:
             await callback.answer("Только владелец может менять настройки семьи.", show_alert=True)
             return
         field = callback.data.split(":", 1)[1]
-        await state.update_data(family_setting=field)
+        provider = callback.data.rsplit(":", 1)[-1] if field.startswith("ai_key:") else "openai"
+        if field.startswith("ai_key:"):
+            field = "ai_key"
+        await state.update_data(family_setting=field, ai_key_provider=provider)
         await state.set_state(FamilySettingsFlow.waiting_value)
         prompt = {
             "timezone": "Введите IANA-часовой пояс, например <code>Asia/Jerusalem</code>.",
             "currency": "Введите трёхбуквенный ISO-код валюты, например <code>RUB</code>.",
             "retention": "Введите срок хранения Telegram file_id чека в днях: от <code>0</code> (не хранить) до <code>3650</code>.",
             "openai_key": "Введите OpenAI API key семьи. Он будет зашифрован и никогда не выводится в чат.",
+            "ai_key": f"Введите API key {provider} для этой семьи. Он будет зашифрован. Сообщение с ключом будет удалено, если Telegram позволит.",
         }[field]
         await rich.send(bot, callback.message.chat.id, f"<p>{prompt}</p>")
     else:
@@ -1592,9 +1608,10 @@ async def family_action(callback: CallbackQuery, state: FSMContext, bot: Bot) ->
 
 @router.message(FamilySettingsFlow.waiting_value)
 async def family_setting_value(message: Message, state: FSMContext, bot: Bot) -> None:
-    field = (await state.get_data()).get("family_setting")
+    data = await state.get_data()
+    field = data.get("family_setting")
     user = await ensure_user(message)
-    if field not in {"timezone", "currency", "retention", "openai_key"} or user.role != "owner" or not user.family_id:
+    if field not in {"timezone", "currency", "retention", "openai_key", "ai_key"} or user.role != "owner" or not user.family_id:
         await state.clear()
         await rich.send(bot, message.chat.id, "<p>Сессия настройки недоступна.</p>")
         return
@@ -1605,14 +1622,17 @@ async def family_setting_value(message: Message, state: FSMContext, bot: Bot) ->
                 await update_family_preferences(session, family, timezone_name=(message.text or "").strip())
             elif field == "currency":
                 await update_family_preferences(session, family, currency=(message.text or "").strip())
-            elif field == "openai_key":
-                await set_family_openai_api_key(session, family, message.text or "")
+            elif field in {"openai_key", "ai_key"}:
+                await set_family_ai_key(session, family, data.get("ai_key_provider", "openai"), message.text or "")
             else:
                 await set_receipt_retention_policy(session, family, int((message.text or "").strip()))
     except (ValueError, KeyError) as error:
         await rich.send(bot, message.chat.id, f"<p>{esc(error)}</p>")
         return
     await state.clear()
+    if field in {"openai_key", "ai_key"}:
+        with suppress(Exception):
+            await message.delete()
     await rich.send(bot, message.chat.id, "<p>Настройка семьи сохранена.</p>")
 
 
@@ -1634,9 +1654,15 @@ async def family_screen(message: Message, bot: Bot) -> None:
         bot_username = (await bot.get_me()).username or ""
         invite_rows = "".join(f"<tr><td>{invitation_anchor(invitation_url(bot_username, item.code))}</td><td>{esc(item.role)}</td><td>{item.uses_count}{'/' + str(item.max_uses) if item.max_uses else ''}</td><td>{link(f'family:revoke:{item.id}', 'Отозвать')}</td></tr>" for item in invites) or '<tr><td colspan="4">Нет активных приглашений.</td></tr>'
         notifications = "включены" if family and family.notify_members_on_transactions else "выключены"
-        ai_key_status = "настроен" if family and family.openai_api_key else "не задан"
-        ai_model = family.openai_model if family else "gpt-5.4"
-        invite_section = f"<h3>Приглашения</h3><table><tr><th>Код</th><th>Роль</th><th>Использования</th><th></th></tr>{invite_rows}</table><p>{link('family:invite:viewer', 'Новое приглашение')} · {link('family:invite:editor', 'Пригласить редактора')} · {link('family:rotate', 'Сменить общий код')}</p><h3>Настройки семьи</h3><p>{link('family:timezone', 'Часовой пояс')} · {link('family:currency', 'Валюта')} · {link('family:retention', 'Срок хранения чеков')}</p><p>OpenAI key: <b>{ai_key_status}</b> · {link('family:openai_key', 'Изменить')}</p><p>Модель: <code>{esc(ai_model)}</code> · {link('family:openai_model', 'Выбрать')}</p><p>Уведомления о новых операциях: <b>{notifications}</b> · {link('family:notify', 'Изменить')}</p>"
+        provider = family.ai_provider or "openai"
+        provider_rows = "".join(
+            f"<tr><td>{esc(p)}{' ✓' if p == provider else ''} {link(f'family:provider:{p}', 'Выбрать')}</td>"
+            f"<td>{'задан' if getattr(family, p + '_api_key') else 'не задан'} {link(f'family:ai_key:{p}', 'Изменить ключ')}</td>"
+            f"<td>{esc(getattr(family, p + '_model'))}</td></tr>"
+            for p in ("google", "openai")
+        )
+        ai_section = f"<h3>AI семьи</h3><table><tr><th>Провайдер</th><th>Ключ</th><th>Модель</th></tr>{provider_rows}</table><p>{link('family:openai_model', 'Выбрать модель активного провайдера')}</p><p>Ключи и модели сохраняются отдельно. Названия товаров показываются в оригинале.</p>"
+        invite_section = f"<h3>Приглашения</h3><table><tr><th>Код</th><th>Роль</th><th>Использования</th><th></th></tr>{invite_rows}</table><p>{link('family:invite:viewer', 'Новое приглашение')} · {link('family:invite:editor', 'Пригласить редактора')} · {link('family:rotate', 'Сменить общий код')}</p><h3>Настройки семьи</h3><p>{link('family:timezone', 'Часовой пояс')} · {link('family:currency', 'Валюта')} · {link('family:retention', 'Срок хранения чеков')}</p>{ai_section}<p>Уведомления о новых операциях: <b>{notifications}</b> · {link('family:notify', 'Изменить')}</p>"
     await rich.send(bot, message.chat.id, f"<h3>{esc(family.name if family else 'Семья')}</h3><p>Часовой пояс: <code>{esc(family.timezone if family else '')}</code> · Валюта: <code>{esc(family.currency if family else '')}</code> · Чеки: <code>{esc(family.receipt_retention_days if family else 0)} дней</code></p><h3>Участники</h3><table><tr><th>Имя</th><th>Роль</th></tr>{member_rows}</table>{invite_section}")
 
 
@@ -1787,10 +1813,9 @@ async def ask_confirmation(
 
 
 def receipt_item_display_name(item) -> str:
-    """Presentation only: retain original text next to any optional translation."""
+    """Use original text even for older drafts containing a display translation."""
     original = item.get("name", "") if isinstance(item, dict) else item.name
-    translated = item.get("display_name") if isinstance(item, dict) else getattr(item, "display_name", None)
-    return f"{translated} ({original})" if translated and translated != original else original
+    return original
 
 
 def draft_html(
@@ -1984,19 +2009,9 @@ async def transaction_action(callback: CallbackQuery, state: FSMContext, bot: Bo
             }]
         await callback.answer("Повторно распознаю чек…")
         try:
-            pages: list[tuple[bytes, str]] = []
-            for attachment in attachments:
-                file_id = attachment.get("file_id")
-                mime_type = attachment.get("mime_type") or "image/jpeg"
-                if not file_id:
-                    continue
-                file = await bot.get_file(file_id)
-                raw = (await bot.download_file(file.file_path)).read()
-                if mime_type.lower() == "application/pdf":
-                    pages.extend(render_pdf_pages(raw))
-                else:
-                    pages.append((raw, mime_type))
-            parsed = await ai_parser.parse_receipt_images(pages, names, runtime)
+            async with receipt_progress(bot, callback.message.chat.id, rich) as progress:
+                pages = await download_receipt_pages(bot, [(a["file_id"], a.get("mime_type") or "image/jpeg") for a in attachments if a.get("file_id")])
+                parsed = await ai_parser.parse_receipt_images(pages, names, runtime, progress=progress)
         except (ReceiptError, AIUnavailableError) as error:
             await rich.send(bot, callback.message.chat.id, f"<p>{esc(error)}</p>")
             return
@@ -2344,14 +2359,29 @@ async def shortcut_report(callback: CallbackQuery, bot: Bot) -> None:
     await callback.answer()
 
 
+async def download_receipt_pages(bot, attachments):
+    pages = []
+    for file_id, mime_type in attachments:
+        try:
+            file = await bot.get_file(file_id)
+            raw = (await bot.download_file(file.file_path)).read()
+        except Exception as error:
+            raise ReceiptError("Не удалось загрузить исходный чек из Telegram. Повторите попытку или отправьте файл заново.") from error
+        if mime_type.lower() == "application/pdf":
+            pages.extend(render_pdf_pages(raw))
+        else:
+            pages.append((raw, mime_type))
+    return pages
+
+
 async def parse_receipt_file(
-    content: bytes, mime_type: str, categories: list[str], runtime
+    content: bytes, mime_type: str, categories: list[str], runtime, progress=None
 ) -> ParsedTransaction | None:
     if mime_type.lower() == "application/pdf":
         return await ai_parser.parse_receipt_images(
-            render_pdf_pages(content), categories, runtime, native_text=extract_pdf_text(content)
+            render_pdf_pages(content), categories, runtime, native_text=extract_pdf_text(content), progress=progress
         )
-    return await ai_parser.parse_receipt_images([(content, mime_type)], categories, runtime)
+    return await ai_parser.parse_receipt_images([(content, mime_type)], categories, runtime, progress=progress)
 
 
 def receipt_attachment(message: Message) -> tuple[str, str] | None:
@@ -2387,20 +2417,14 @@ async def recognize_receipt_messages(messages: list[Message], bot: Bot, one_rece
             if attachment:
                 await recognize_receipt_messages([message], bot, one_receipt=True)
         return
-    await rich.send(bot, messages[0].chat.id, "<p>Распознаю чек…</p>")
     try:
-        pages: list[tuple[bytes, str]] = []
-        for file_id, mime_type in attachments:
-            file = await bot.get_file(file_id)
-            content = await bot.download_file(file.file_path)
-            raw = content.read()
-            if mime_type.lower() == "application/pdf":
-                pages.extend(render_pdf_pages(raw))
-            else:
-                pages.append((raw, mime_type))
-        parsed = await ai_parser.parse_receipt_images(pages, names, runtime)
+        async with receipt_progress(bot, messages[0].chat.id, rich) as progress:
+            pages = await download_receipt_pages(bot, attachments)
+            parsed = await ai_parser.parse_receipt_images(pages, names, runtime, progress=progress)
     except (ReceiptError, AIUnavailableError) as error:
-        await rich.send(bot, messages[0].chat.id, f"<p>{esc(error)}</p>")
+        token = secrets.token_urlsafe(12)
+        _receipt_album_choices[token] = ReceiptAlbum(user_id=messages[0].from_user.id, chat_id=messages[0].chat.id, messages=messages, expires_at=expiry())
+        await rich.send(bot, messages[0].chat.id, f"<p>{esc(error)}</p><p>{link(f'album:{token}:one', 'Распознать заново')}</p>")
         return
     if not parsed:
         await rich.send(bot, messages[0].chat.id, "<p>Не удалось распознать чек. Пришлите страницы ещё раз или введите операцию вручную.</p>")
@@ -2419,7 +2443,9 @@ async def flush_receipt_album(key: str, bot: Bot) -> None:
         await recognize_receipt_messages(messages, bot, one_receipt=True)
         return
     messages.sort(key=lambda item: item.message_id)
-    groups = await detect_receipt_groups(messages, bot)
+    async with receipt_progress(bot, messages[0].chat.id, rich) as progress:
+        await progress("Определяю, какие фотографии относятся к одному чеку…")
+        groups = await detect_receipt_groups(messages, bot)
     if groups:
         for group in groups:
             await recognize_receipt_messages(group, bot, one_receipt=True)
@@ -2444,7 +2470,7 @@ async def detect_receipt_groups(messages: list[Message], bot: Bot) -> list[list[
         return None
     async with SessionLocal() as session:
         runtime = await get_family_ai_settings(session, user.family_id)
-    if not runtime.openai_api_key:
+    if not runtime.api_key:
         return None
     try:
         content: list[dict] = [{"type": "text", "text": (
@@ -2462,10 +2488,10 @@ async def detect_receipt_groups(messages: list[Message], bot: Bot) -> list[list[
                 return None  # Albums with PDFs are rare; retain the explicit choice.
             content.append({"type": "text", "text": f"Photo {index}:"})
             content.append({"type": "image_url", "image_url": {"url": f"data:{attachment[1]};base64,{base64.b64encode(raw).decode('ascii')}", "detail": "low"}})
-        client = AsyncOpenAI(api_key=runtime.openai_api_key)
+        client = GoogleClient(runtime.api_key, runtime.model) if runtime.provider == "google" else AsyncOpenAI(api_key=runtime.api_key)
         try:
             response = await client.chat.completions.create(
-                model="gpt-5-mini",
+                model=runtime.model,
                 messages=[{"role": "user", "content": content}],
                 response_format={"type": "json_schema", "json_schema": {"name": "receipt_album_groups", "strict": True, "schema": {
                     "type": "object", "additionalProperties": False,
@@ -2522,16 +2548,17 @@ async def receipt_url(message: Message, bot: Bot) -> None:
     if not user.family_id:
         await rich.send(bot, message.chat.id, "<p>Сначала выполните /start.</p>")
         return
-    await rich.send(bot, message.chat.id, "<p>Загружаю и распознаю чек по ссылке…</p>")
     try:
-        payload = await fetch_receipt_url(raw_url)
-        async with SessionLocal() as session:
-            names = [item.name for item in await list_categories(session, user.family_id, "expense")]
-            runtime = await get_family_ai_settings(session, user.family_id)
-        if payload.kind == "text":
-            parsed = await ai_parser.parse_text(f"Содержимое чека: {payload.content}", names, runtime)
-        else:
-            parsed = await parse_receipt_file(payload.content, payload.mime_type or "image/jpeg", names, runtime)
+        async with receipt_progress(bot, message.chat.id, rich) as progress:
+            payload = await fetch_receipt_url(raw_url)
+            async with SessionLocal() as session:
+                names = [item.name for item in await list_categories(session, user.family_id, "expense")]
+                runtime = await get_family_ai_settings(session, user.family_id)
+            if payload.kind == "text":
+                await progress("Распознаю и классифицирую текст чека…")
+                parsed = await ai_parser.parse_text(f"Содержимое чека: {payload.content}", names, runtime)
+            else:
+                parsed = await parse_receipt_file(payload.content, payload.mime_type or "image/jpeg", names, runtime, progress)
     except (ReceiptError, AIUnavailableError) as error:
         await rich.send(bot, message.chat.id, f"<p>{esc(error)}</p>")
         return
