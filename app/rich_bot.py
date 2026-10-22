@@ -1786,6 +1786,13 @@ async def ask_confirmation(
             draft.message_id = result.get("message_id")
 
 
+def receipt_item_display_name(item) -> str:
+    """Presentation only: retain original text next to any optional translation."""
+    original = item.get("name", "") if isinstance(item, dict) else item.name
+    translated = item.get("display_name") if isinstance(item, dict) else getattr(item, "display_name", None)
+    return f"{translated} ({original})" if translated and translated != original else original
+
+
 def draft_html(
     token: str,
     amount: Decimal,
@@ -1805,7 +1812,7 @@ def draft_html(
     direction = "Доход" if tx_type == "income" else "Расход"
     item_table = ""
     review_links = [
-        link(f"txi:{token}:{index}", item.get("name") if isinstance(item, dict) else item.name)
+        link(f"txi:{token}:{index}", receipt_item_display_name(item))
         for index, item in enumerate(items or [])
         if (item.get("category_needs_review", False) if isinstance(item, dict)
             else getattr(item, "category_needs_review", False))
@@ -1829,7 +1836,7 @@ def draft_html(
                     item_category = item.get("category") if isinstance(item, dict) else item.category
                     if item_category != group["category"]:
                         continue
-                    item_name = item.get("name") if isinstance(item, dict) else item.name
+                    item_name = receipt_item_display_name(item)
                     item_amount = item.get("amount") if isinstance(item, dict) else item.amount
                     item_discount = Decimal(str(item.get("item_discount", 0) if isinstance(item, dict) else item.item_discount))
                     amount_text = money(item_amount, currency)
@@ -2056,7 +2063,7 @@ async def transaction_action(callback: CallbackQuery, state: FSMContext, bot: Bo
         elif action == "items":
             family = await session.get(Family, draft.family_id)
             item_rows = "".join(
-                f"<tr><td>{esc(item['name'])}</td><td>{link(f'txi:{token}:{index}', item['category'])}</td><td>{esc(money(item['amount'], family.currency if family else 'ILS'))}</td></tr>"
+                f"<tr><td>{esc(receipt_item_display_name(item))}</td><td>{link(f'txi:{token}:{index}', item['category'])}</td><td>{esc(money(item['amount'], family.currency if family else 'ILS'))}</td></tr>"
                 for index, item in enumerate(draft.items or [])
             )
             html = f"<h3>Позиции чека</h3><table><tr><th>Позиция</th><th>Категория</th><th>Сумма</th></tr>{item_rows}</table><p>Категория у позиции редактируется по ссылке. При сохранении позиции объединятся по категориям.</p><p>{link(f'tx:{token}:overview', '← К разбивке')} · {link(f'tx:{token}:save', '✓ Записать по категориям')} · {link(f'tx:{token}:cancel', 'Отмена')}</p>"

@@ -79,6 +79,8 @@ amount позиций. Для обычного текста верните пу�
 
 class ReceiptItem(BaseModel):
     name: str = Field(min_length=1, max_length=240)
+    display_name: str | None = Field(default=None, max_length=240)
+    source_text: str | None = None
     amount: Decimal = Field(gt=0)
     item_discount: Decimal = Field(default=Decimal("0"), ge=0)
     category: str = Field(min_length=1, max_length=120)

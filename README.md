@@ -80,8 +80,15 @@ On a mismatch, one additional image verification pass checks the extracted rows;
 it cannot change the original total or invent a balancing adjustment. A receipt
 that still fails validation is not recorded. This is a consistency check, not a
 guarantee that every product name or category was read correctly.
-Classification receives original receipt text and photos alongside translated names,
-uses only active expense categories, and maps results by product ID. Ambiguous
+Extraction and classification use only original-language names, receipt text and photos.
+Russian display translations are generated in a separate request AFTER categories
+are fixed; they never feed back into classification, arithmetic or grouping. Original
+names and evidence remain in receipt items, with translations in a separate optional
+field used only by the UI. Failed translation falls back to the original text.
+The separate UI translation request can increase API usage; no more expensive
+model is selected automatically. Separating translation does not eliminate OCR
+errors in the original language or guarantee correct category suggestions.
+Classification uses only active expense categories and maps results by product ID. Ambiguous
 assignments are flagged in the draft with a category-review link. Review flags
 are advisory and cleared when the user chooses a category.
 

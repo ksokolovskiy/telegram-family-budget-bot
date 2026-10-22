@@ -4,7 +4,14 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from app.receipt_facts import Facts, calculate, recognize
+from app.receipt_facts import Facts, calculate, recognize, translate_for_display
+
+
+@pytest.fixture(autouse=True)
+def display_translation(monkeypatch):
+    mock = AsyncMock(return_value={})
+    monkeypatch.setattr('app.receipt_facts.translate_for_display', mock)
+    return mock
 
 
 def sample():
@@ -155,3 +162,57 @@ def test_uncertain_category_has_review_link_even_when_collapsed():
         assert 'Проверьте категории' in html
         assert 'txi:test:0' in html
         assert 'Неясный товар' in html
+
+
+async def test_translation_never_enters_classification(display_translation):
+    import json
+    data = sample()
+    data['products'][0]['name'] = 'מגבונים'
+    data['products'][0]['text'] = 'מגבונים 9.50'
+    display_translation.return_value = {1: 'Ошибочный перевод: орехи'}
+    labels = [{'id': 1, 'category': 'Дом', 'needs_review': False},
+              {'id': 2, 'category': 'Продукты', 'needs_review': False}]
+    create = AsyncMock(side_effect=[response(json.dumps(data)), response(json.dumps({'categories': labels}))])
+    client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+    parsed = await recognize(client, 'test', [(b'photo', 'image/jpeg')], ['Дом', 'Продукты'])
+    item = parsed.items[0]
+    assert item.name == 'מגבונים'
+    assert item.source_text == 'מגבונים 9.50'
+    assert item.category == 'Дом'
+    assert item.display_name == 'Ошибочный перевод: орехи'
+    prompt = create.call_args.kwargs['messages'][0]['content'][0]['text']
+    assert 'מגבונים' in prompt
+    assert 'Ошибочный перевод' not in prompt
+    from app.rich_bot import receipt_category_groups, receipt_item_display_name
+    assert receipt_category_groups(parsed.items)[0]['names'] == ['מגבונים']
+    assert 'Ошибочный перевод' in receipt_item_display_name(item)
+
+
+@pytest.mark.parametrize('payload', ['{}', '{"names":[{"id":1,"text":"Орехи"},{"id":1,"text":"Орехи"}]}'])
+async def test_invalid_display_translation_falls_back_to_original(payload):
+    client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=AsyncMock(return_value=response(payload)))))
+    assert await translate_for_display(client, 'test', Facts.model_validate(sample()).products) == {}
+
+
+async def test_display_translation_maps_by_id():
+    client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=AsyncMock(
+        return_value=response('{"names":[{"id":2,"text":null},{"id":1,"text":"Масло"}]}')
+    ))))
+    assert await translate_for_display(client, 'test', Facts.model_validate(sample()).products) == {1: 'Масло', 2: None}
+
+
+async def test_display_translation_network_failure_is_nonfatal():
+    import httpx
+    from openai import APIConnectionError
+    error = APIConnectionError(request=httpx.Request('POST', 'https://api.openai.com/v1/chat/completions'))
+    client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=AsyncMock(side_effect=error))))
+    assert await translate_for_display(client, 'test', Facts.model_validate(sample()).products) == {}
+
+
+def test_numeric_schema_disallows_units_and_currency_symbols():
+    import re
+    schema = Facts.model_json_schema()
+    pattern = schema['properties']['total']['pattern']
+    assert re.fullmatch(pattern, '591.32')
+    assert not re.fullmatch(pattern, '591.32 ₪')
+    assert not re.fullmatch(pattern, '1.012 ק"ג')
