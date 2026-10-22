@@ -80,6 +80,10 @@ On a mismatch, one additional image verification pass checks the extracted rows;
 it cannot change the original total or invent a balancing adjustment. A receipt
 that still fails validation is not recorded. This is a consistency check, not a
 guarantee that every product name or category was read correctly.
+Classification receives original receipt text and photos alongside translated names,
+uses only active expense categories, and maps results by product ID. Ambiguous
+assignments are flagged in the draft with a category-review link. Review flags
+are advisory and cleared when the user chooses a category.
 
 Rotating `BOT_TOKEN` changes the encryption key: retain the old token securely
 until family keys have been migrated, or have each family owner re-enter their

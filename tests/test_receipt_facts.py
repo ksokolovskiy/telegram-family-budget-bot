@@ -52,12 +52,16 @@ async def test_independent_verifier_precedes_classification():
     data['products'][1]['gross'] = '9.50'
     import json
     create = AsyncMock(side_effect=[response(json.dumps(data)), response(json.dumps(sample())),
-                                   response('{"categories":["Продукты","Продукты"]}')])
+                                   response('{"categories":[{"id":2,"category":"Продукты","needs_review":true},{"id":1,"category":"Продукты","needs_review":false}]}')])
     client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
     parsed = await recognize(client, 'test-model', [(b'photo', 'image/jpeg')], ['Продукты'])
     assert parsed.amount == Decimal('28.47')
     assert sum((i.amount for i in parsed.items), Decimal(0)) == parsed.amount
     assert create.await_count == 3
+    assert [i.category_needs_review for i in parsed.items] == [False, True]
+    content = create.call_args.kwargs['messages'][0]['content']
+    assert 'source_text' in content[0]['text']
+    assert any(part['type'] == 'image_url' for part in content)
 
 
 async def test_failed_verification_never_classifies_or_balances():
@@ -112,3 +116,42 @@ async def test_public_parser_uses_fact_pipeline(monkeypatch):
     runtime = FamilyAISettings(openai_api_key=None, openai_model='test')
     assert await parser.parse_receipt_images([], ['Продукты'], runtime) is expected
     recognize_mock.assert_awaited_once_with(client, 'test', [], ['Продукты'], None)
+
+
+@pytest.mark.parametrize('labels', [
+    [{'id': 1, 'category': 'Дом', 'needs_review': False}] * 2,
+    [{'id': 1, 'category': 'Дом', 'needs_review': False}],
+    [{'id': 1, 'category': 'Зарплата', 'needs_review': False},
+     {'id': 2, 'category': 'Дом', 'needs_review': False}],
+    [{'id': 1, 'category': 'Дом', 'needs_review': False},
+     {'id': 999, 'category': 'Дом', 'needs_review': False}],
+])
+async def test_invalid_classification_mapping_is_rejected(labels):
+    import json
+    create = AsyncMock(side_effect=[response(json.dumps(sample())),
+                                   response(json.dumps({'categories': labels}))])
+    client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+    with pytest.raises(ValueError, match='category mapping'):
+        await recognize(client, 'test', [(b'photo', 'image/jpeg')], ['Дом', 'Продукты'])
+
+
+async def test_categories_follow_ids_not_response_order():
+    import json
+    labels = [{'id': 2, 'category': 'Дом', 'needs_review': True},
+              {'id': 1, 'category': 'Продукты', 'needs_review': False}]
+    create = AsyncMock(side_effect=[response(json.dumps(sample())),
+                                   response(json.dumps({'categories': labels}))])
+    client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+    parsed = await recognize(client, 'test', [(b'photo', 'image/jpeg')], ['Дом', 'Продукты'])
+    assert [(i.category, i.category_needs_review) for i in parsed.items] == [('Продукты', False), ('Дом', True)]
+
+
+def test_uncertain_category_has_review_link_even_when_collapsed():
+    from app.ai import ReceiptItem
+    from app.rich_bot import draft_html
+    item = ReceiptItem(name='Неясный товар', amount='10', category='Дом', category_needs_review=True)
+    for items in ([item], [item.model_dump(mode='json')]):
+        html = draft_html('test', Decimal('10'), 'expense', 'Дом', None, items)
+        assert 'Проверьте категории' in html
+        assert 'txi:test:0' in html
+        assert 'Неясный товар' in html

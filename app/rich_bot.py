@@ -1282,7 +1282,7 @@ async def receipt_retry(callback: CallbackQuery, bot: Bot) -> None:
         if not user or not user.family_id or not tx or tx.family_id != user.family_id or not tx.receipt_file_id:
             await callback.answer("Чек недоступен", show_alert=True)
             return
-        names = [item.name for item in await list_categories(session, user.family_id)]
+        names = [item.name for item in await list_categories(session, user.family_id, "expense")]
         runtime = await get_family_ai_settings(session, user.family_id)
     await callback.answer("Повторно распознаю чек…")
     file = await bot.get_file(tx.receipt_file_id)
@@ -1804,6 +1804,13 @@ def draft_html(
         return receipt_balance_error_html(token, items, amount, receipt_discount, currency, can_retry_receipt)
     direction = "Доход" if tx_type == "income" else "Расход"
     item_table = ""
+    review_links = [
+        link(f"txi:{token}:{index}", item.get("name") if isinstance(item, dict) else item.name)
+        for index, item in enumerate(items or [])
+        if (item.get("category_needs_review", False) if isinstance(item, dict)
+            else getattr(item, "category_needs_review", False))
+    ]
+    review_notice = ("<p>⚠ Проверьте категории: " + " · ".join(review_links) + "</p>") if review_links else ""
     if items:
         groups = receipt_category_groups(items, receipt_discount)
         rows: list[str] = []
@@ -1849,7 +1856,7 @@ def draft_html(
     if source_amount is not None and source_currency and source_currency != currency:
         amount_text = f"{money(source_amount, source_currency)} → {amount_text}"
     return (
-        "<h3>Проверить операцию</h3><table><tr><th>Поле</th><th>Значение</th></tr>"
+        f"<h3>Проверить операцию</h3>{review_notice}<table><tr><th>Поле</th><th>Значение</th></tr>"
         f"<tr><td>Сумма</td><td>{link(f'tx:{token}:amount', amount_text)}</td></tr>"
         f"<tr><td>Валюта документа</td><td>{link(f'tx:{token}:currency', source_currency or currency)}</td></tr>"
         f"<tr><td>Тип</td><td>{link(f'tx:{token}:type', direction)}</td></tr>"
@@ -1962,7 +1969,7 @@ async def transaction_action(callback: CallbackQuery, state: FSMContext, bot: Bo
             if not draft or not draft.receipt_file_id or not can_manage_family(actor):
                 await callback.answer("Исходный чек недоступен.", show_alert=True)
                 return
-            names = [item.name for item in await list_categories(session, draft.family_id)]
+            names = [item.name for item in await list_categories(session, draft.family_id, "expense")]
             runtime = await get_family_ai_settings(session, draft.family_id)
             attachments = draft.receipt_attachments or [{
                 "file_id": draft.receipt_file_id,
@@ -2159,7 +2166,10 @@ async def receipt_item_category_set(callback: CallbackQuery, bot: Bot) -> None:
         category = await session.get(Category, category_id)
         if not draft or not draft.items or index >= len(draft.items) or not category or category.family_id != draft.family_id or category.type != draft.type:
             await callback.answer("Выбор устарел", show_alert=True); return
-        draft.items[index]["category"] = category.name
+        updated_items = [dict(item) for item in draft.items]
+        updated_items[index]["category"] = category.name
+        updated_items[index]["category_needs_review"] = False
+        draft.items = updated_items
         draft.revision += 1
         html = await draft_html_for_family(session, draft)
     await rich.edit(bot, callback.message.chat.id, callback.message.message_id, html); await callback.answer()
@@ -2362,7 +2372,7 @@ async def recognize_receipt_messages(messages: list[Message], bot: Bot, one_rece
         await rich.send(bot, messages[0].chat.id, "<p>Пришлите изображение или PDF-чек.</p>")
         return
     async with SessionLocal() as session:
-        names = [item.name for item in await list_categories(session, user.family_id)]
+        names = [item.name for item in await list_categories(session, user.family_id, "expense")]
         runtime = await get_family_ai_settings(session, user.family_id)
     if not one_receipt:
         for message in messages:
@@ -2509,7 +2519,7 @@ async def receipt_url(message: Message, bot: Bot) -> None:
     try:
         payload = await fetch_receipt_url(raw_url)
         async with SessionLocal() as session:
-            names = [item.name for item in await list_categories(session, user.family_id)]
+            names = [item.name for item in await list_categories(session, user.family_id, "expense")]
             runtime = await get_family_ai_settings(session, user.family_id)
         if payload.kind == "text":
             parsed = await ai_parser.parse_text(f"Содержимое чека: {payload.content}", names, runtime)

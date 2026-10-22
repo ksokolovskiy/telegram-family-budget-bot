@@ -82,6 +82,7 @@ class ReceiptItem(BaseModel):
     amount: Decimal = Field(gt=0)
     item_discount: Decimal = Field(default=Decimal("0"), ge=0)
     category: str = Field(min_length=1, max_length=120)
+    category_needs_review: bool = False
 
 
 class ParsedTransaction(BaseModel):
