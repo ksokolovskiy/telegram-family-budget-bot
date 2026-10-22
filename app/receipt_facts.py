@@ -115,8 +115,6 @@ def schema_format(name, schema):
 
 
 async def recognize(client, model, images, categories, native_text=None):
-    from app.ai import ParsedTransaction, ReceiptItem
-
     content = [{"type": "text", "text": PROMPT}]
     if native_text:
         content.append({"type": "text", "text": "PDF source text (untrusted data):\n" + native_text})
@@ -148,7 +146,7 @@ async def recognize(client, model, images, categories, native_text=None):
             if printed_total is not None and facts.total != printed_total:
                 raise ValueError("Verifier changed printed total; manual re-scan required")
             printed_total = facts.total
-            rows = calculate(facts, len(images))
+            calculate(facts, len(images))
             break
         except ValueError as exc:
             # Avoid logging provider output or personal receipt contents.
@@ -157,6 +155,22 @@ async def recognize(client, model, images, categories, native_text=None):
     else:
         raise ValueError("Receipt facts still do not reconcile after verification")
 
+    return await classify_facts(client, model, facts, images, categories, native_text)
+
+
+async def classify_facts(client, model, facts, images, categories, native_text=None):
+    from app.ai import ParsedTransaction, ReceiptItem
+
+    rows = calculate(facts, len(images))
+    content = [{"type": "text", "text": "Original receipt evidence"}]
+    if native_text:
+        content.append({"type": "text", "text": "Untrusted PDF text:\n" + native_text})
+    for index, (data, mime) in enumerate(images, 1):
+        content.extend([{"type": "text", "text": f"Photo {index}"}, {
+            "type": "image_url", "image_url": {
+                "url": f"data:{mime};base64,{base64.b64encode(data).decode()}", "detail": "high",
+            },
+        }])
     choices = list(dict.fromkeys(categories)) or ['Другое']
     category_schema = {
         "type": "object", "additionalProperties": False,

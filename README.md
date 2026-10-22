@@ -92,6 +92,28 @@ Classification uses only active expense categories and maps results by product I
 assignments are flagged in the draft with a category-review link. Review flags
 are advisory and cleared when the user chooses a category.
 
+### Experimental staged recognition (not enabled)
+
+`app.receipt_pipeline` separates per-photo original-language OCR, overlap mapping,
+financial interpretation, Decimal validation, targeted rereading, classification,
+and display translation. Rereading is bounded to two cycles with at most six
+requested rows per cycle. Arithmetic failures take priority over layout questions.
+This experiment is **not connected to the bot's input handlers**: passing unit tests
+does not demonstrate improved recognition quality, latency, or cost.
+
+`python -m app.receipt_benchmark --help` describes the private-file A/B runner.
+Supply a snapshot of the production recognizer, identical source files/categories,
+an explicit model and its input/cached-input/output prices, and `OPENAI_API_KEY`.
+It does not poll Telegram or write operations. It records each model response,
+elapsed time and token usage, including incomplete usage on failed calls. Costs
+with missing usage are lower bounds. PDF preparation is outside model timing.
+The baseline can use native PDF text during extraction; the experimental reader
+currently reads page images, with native text passed only to classification.
+Review product names, missing/duplicate purchases, discounts and categories against
+the originals; a matching total alone is not a quality metric. Keep manifests,
+snapshots containing private data, inputs and outputs outside the repository.
+Do not deploy this pipeline without a successful representative comparison.
+
 Rotating `BOT_TOKEN` changes the encryption key: retain the old token securely
 until family keys have been migrated, or have each family owner re-enter their
 OpenAI key after rotation. Receipt files are sent to OpenAI for processing; Telegram
