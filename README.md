@@ -74,6 +74,13 @@ to your PostgreSQL connection string. Never commit it. The worker must start aft
 `alembic upgrade head` completes. FX rates are reference rates, not bank settlement
 rates. Review extracted receipt items before confirming a payment.
 
+Receipt recognition extracts printed product totals and deductions separately.
+Decimal arithmetic validates quantities and allocates discounts before classification.
+On a mismatch, one additional image verification pass checks the extracted rows;
+it cannot change the original total or invent a balancing adjustment. A receipt
+that still fails validation is not recorded. This is a consistency check, not a
+guarantee that every product name or category was read correctly.
+
 Rotating `BOT_TOKEN` changes the encryption key: retain the old token securely
 until family keys have been migrated, or have each family owner re-enter their
 OpenAI key after rotation. Receipt files are sent to OpenAI for processing; Telegram

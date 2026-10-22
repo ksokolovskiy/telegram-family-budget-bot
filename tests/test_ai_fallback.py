@@ -228,7 +228,7 @@ async def test_receipt_parser_repairs_a_large_mismatch_before_returning_a_draft(
 
     monkeypatch.setattr(parser, "_audit_discounts", no_audit)
 
-    result = await parser.parse_receipt_images([(b"image", "image/jpeg")], ["Продукты"], object())
+    result = await parser._legacy_parse_receipt_images([(b"image", "image/jpeg")], ["Продукты"], object())
 
     assert result == repaired
     assert receipt_totals_match(result)

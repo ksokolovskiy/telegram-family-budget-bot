@@ -7,7 +7,7 @@ import re
 from decimal import Decimal, InvalidOperation
 from typing import Any, Literal
 
-from openai import AsyncOpenAI, RateLimitError
+from openai import APIError, AsyncOpenAI, RateLimitError
 from pydantic import BaseModel, Field, ValidationError, field_validator
 
 from app.settings_store import FamilyAISettings
@@ -351,7 +351,27 @@ class AIParser:
             categories, runtime,
         )
 
-    async def parse_receipt_images(
+    async def parse_receipt_images(self, images, categories, runtime, native_text=None):
+        from app.receipt_facts import recognize
+
+        client = self._client_for(runtime)
+        if client is None:
+            return None
+        try:
+            return await recognize(client, runtime.openai_model, images, categories, native_text)
+        except RateLimitError as error:
+            raise AIUnavailableError("OpenAI отклонил запрос по лимиту. Проверьте баланс и повторите.") from error
+        except APIError as error:
+            raise AIUnavailableError(
+                "OpenAI не завершил распознавание. Чек не записан. Повторите отправку чека."
+            ) from error
+        except (ValueError, KeyError) as error:
+            raise AIUnavailableError(
+                "Не удалось сверить строки чека после повторной проверки. "
+                "Чек не записан. Пришлите все фото или PDF ещё раз для повторного распознавания."
+            ) from error
+
+    async def _legacy_parse_receipt_images(
         self,
         images: list[tuple[bytes, str]],
         categories: list[str],
