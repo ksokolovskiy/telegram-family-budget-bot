@@ -2085,10 +2085,11 @@ async def transaction_action(callback: CallbackQuery, state: FSMContext, bot: Bo
         elif action == "overview":
             html = await draft_html_for_family(session, draft)
         elif action in {"amount", "comment"}:
-            await state.update_data(transaction_token=token, transaction_field=action)
+            await state.update_data(transaction_token=token, transaction_field=action, transaction_edit_prompt_id=None)
             await state.set_state(TransactionEditFlow.waiting_value)
             prompt = "Введите сумму числом, например 500.50." if action == "amount" else "Введите комментарий к операции."
-            await rich.send(bot, callback.message.chat.id, f"<p>{prompt}</p>")
+            prompt_message = await rich.send(bot, callback.message.chat.id, f"<p>{prompt}</p>")
+            await state.update_data(transaction_edit_prompt_id=prompt_message.get("message_id"))
             await callback.answer()
             return
         else: await session.delete(draft); html = "<p>Отменено.</p>"
@@ -2318,6 +2319,9 @@ async def transaction_edit_value(message: Message, state: FSMContext, bot: Bot) 
         await state.clear()
         await rich.send(bot, message.chat.id, "<p>Сессия редактирования устарела.</p>")
         return
+    if message.text is None:
+        await rich.send(bot, message.chat.id, "<p>Введите значение текстом.</p>")
+        return
     async with SessionLocal() as session, session.begin():
         draft = await session.scalar(select(TransactionDraft).where(TransactionDraft.token == token).with_for_update())
         if not draft or draft.status != "active" or draft.user_id != message.from_user.id or draft.chat_id != message.chat.id or draft.expires_at <= datetime.now(timezone.utc):
@@ -2343,8 +2347,18 @@ async def transaction_edit_value(message: Message, state: FSMContext, bot: Bot) 
         html = await draft_html_for_family(session, draft)
         message_id = draft.message_id
     await state.clear()
-    await rich.edit(bot, message.chat.id, message_id, html)
-    await rich.send(bot, message.chat.id, "<p>Черновик обновлён.</p>")
+    if message_id:
+        await rich.edit(bot, message.chat.id, message_id, html)
+    else:
+        result = await rich.send(bot, message.chat.id, html)
+        async with SessionLocal() as session, session.begin():
+            current = await session.scalar(select(TransactionDraft).where(TransactionDraft.token == token))
+            if current and current.user_id == message.from_user.id and current.status == "active":
+                current.message_id = result.get("message_id")
+    for temporary_id in (data.get("transaction_edit_prompt_id"), message.message_id):
+        if temporary_id and temporary_id != message_id:
+            with suppress(Exception):
+                await bot.delete_message(message.chat.id, int(temporary_id))
 
 
 @router.callback_query(F.data == "ui:report")
