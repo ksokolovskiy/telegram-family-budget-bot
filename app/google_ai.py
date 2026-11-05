@@ -12,6 +12,20 @@ class GoogleAIError(RuntimeError):
     pass
 
 
+def google_error_message(status, payload):
+    error = payload.get("error", {}) if isinstance(payload, dict) else {}
+    message = str(error.get("message", "")).lower() if isinstance(error, dict) else ""
+    if status == 402 or (status == 429 and any(word in message for word in ("prepayment", "credits are depleted", "insufficient funds"))):
+        return "У Google закончились предоплаченные API-кредиты. Пополните баланс проекта в Google AI Studio: https://ai.studio/projects . После пополнения повторите попытку."
+    if status == 429:
+        return "Google API: превышена квота или частота запросов. Проверьте лимиты проекта и повторите позже."
+    if status in {401, 403}:
+        return "Google API: ключ отклонён или нет доступа к модели. Проверьте ключ и разрешения в настройках AI семьи."
+    if status == 404:
+        return "Google API: выбранная модель недоступна. Выберите доступную модель в настройках AI семьи."
+    return f"Google API временно не выполнил запрос (HTTP {status}). Повторите попытку позже."
+
+
 class GoogleClient:
     def __init__(self, api_key, model):
         self._key, self.model = api_key, model
@@ -28,9 +42,11 @@ class GoogleClient:
                 ) as response:
                     if response.status != 200:
                         # Never include provider bodies, headers or keys in errors/logs.
-                        raise GoogleAIError(
-                            f"Google API: HTTP {response.status}. Проверьте ключ, доступ и квоту."
-                        )
+                        try:
+                            payload = await response.json()
+                        except (ValueError, aiohttp.ContentTypeError):
+                            payload = {}
+                        raise GoogleAIError(google_error_message(response.status, payload))
                     return await response.json()
         except (aiohttp.ClientError, asyncio.TimeoutError) as error:
             raise GoogleAIError(

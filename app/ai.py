@@ -334,8 +334,11 @@ class AIParser:
         return self.client
 
     async def parse_text(self, text: str, categories: list[str], runtime: FamilyAISettings) -> ParsedTransaction | None:
+        local = fallback_parse_text(text, categories)
+        if local is not None:
+            return local
         if not self._client_for(runtime):
-            return fallback_parse_text(text, categories)
+            return None
         return await self._parse([{"type": "text", "text": text}], categories, runtime)
 
     async def parse_image(self, image_bytes: bytes, mime_type: str, categories: list[str], runtime: FamilyAISettings) -> ParsedTransaction | None:
@@ -485,6 +488,7 @@ class AIParser:
             return None
 
     async def _parse(self, content: list[dict[str, Any]], categories: list[str], runtime: FamilyAISettings) -> ParsedTransaction | None:
+        from app.google_ai import GoogleAIError
         # Keep a local reference. Another family's simultaneous request may
         # replace the cache for later calls, but can never change the client
         # (and therefore API key) used by this request.
@@ -504,9 +508,10 @@ class AIParser:
             )
             raw = response.choices[0].message.content or "{}"
             return ParsedTransaction.model_validate(discard_zero_amount_receipt_items(json.loads(raw)))
-        except RateLimitError as error:
-            logger.warning("OpenAI request was rate-limited or has no credit: %s", error)
-            raise AIUnavailableError("У OpenAI API key семьи закончился баланс. Пополните API billing и повторите.") from error
+        except GoogleAIError as error:
+            raise AIUnavailableError(str(error)) from error
+        except APIError as error:
+            raise AIUnavailableError(openai_error_message(error)) from error
         except (json.JSONDecodeError, ValidationError) as error:
             logger.warning("OpenAI returned an invalid receipt payload: %s", error)
             return None
@@ -522,17 +527,34 @@ def fallback_parse_text(text: str, categories: list[str]) -> ParsedTransaction |
     if not parts:
         return None
     raw_amount = parts[0].replace(",", ".")
+    if not re.fullmatch(r"[+-]?\d+(?:\.\d+)?", raw_amount):
+        return None
     tx_type = "income" if raw_amount.startswith("+") else "expense"
     raw_amount = raw_amount.lstrip("+")
     try:
         amount = Decimal(raw_amount)
     except InvalidOperation:
         return None
-    tail = parts[1] if len(parts) > 1 else "Другое"
-    category = next((name for name in categories if name.lower() in tail.lower()), None)
+    if not amount.is_finite() or amount <= 0:
+        return None
+    tail = parts[1] if len(parts) > 1 else ""
+    category = next((name for name in sorted(categories, key=len, reverse=True)
+                     if re.search(r"(?<!\w)" + re.escape(name) + r"(?!\w)", tail, re.IGNORECASE)), None)
     if not category:
-        category = tail.split(maxsplit=1)[0].title() if tail else "Другое"
+        return ParsedTransaction(amount=amount, type=tx_type, category="Другое", comment=tail or None)
     # A recognised category is structured data, not part of the note.  Thus
     # "400 Авто заправка" becomes category "Авто", comment "заправка".
     comment = re.sub(re.escape(category), "", tail, count=1, flags=re.IGNORECASE).strip(" ,;:-") or None
     return ParsedTransaction(amount=amount, type=tx_type, category=category, comment=comment)
+
+
+def openai_error_message(error):
+    status = getattr(error, "status_code", None)
+    code = getattr(error, "code", None)
+    if status == 402 or code in {"insufficient_quota", "billing_hard_limit_reached"}:
+        return "У OpenAI закончился API-баланс или достигнут лимит расходов. Проверьте API billing семьи."
+    if status == 429:
+        return "OpenAI ограничил частоту запросов. Повторите попытку позже."
+    if status in {401, 403}:
+        return "OpenAI отклонил ключ или доступ к модели. Проверьте настройки AI семьи."
+    return "OpenAI временно не выполнил запрос. Повторите попытку позже."
