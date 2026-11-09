@@ -2279,6 +2279,15 @@ async def typed_transaction_currency(message: Message, state: FSMContext, bot: B
 @router.message(TransactionEditFlow.waiting_value)
 async def transaction_edit_value(message: Message, state: FSMContext, bot: Bot) -> None:
     data = await state.get_data()
+    # An explicit currency identifies a complete payment, even when a previous
+    # amount-edit prompt is still active in Telegram's conversation state.
+    _, amount, currency, _ = inline_payment_parts(message.text or "")
+    if currency and amount is not None and amount > 0 and (
+        data.get("transaction_field") == "amount" or data.get("saved_transaction_field") == "amount"
+    ):
+        await state.clear()
+        await text(message, bot)
+        return
     saved_id, saved_field = data.get("saved_transaction_id"), data.get("saved_transaction_field")
     if saved_id and saved_field in {"amount", "date", "comment"}:
         async with SessionLocal() as session, session.begin():
