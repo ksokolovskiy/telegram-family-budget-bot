@@ -27,6 +27,7 @@ from openai import AsyncOpenAI
 from sqlalchemy import func, select
 
 from app.ai import AIParser, AIUnavailableError, ParsedTransaction
+from app.installments import register as register_installments
 from app.config import settings
 from app.db import SessionLocal
 from app.models import Account, Category, Family, FamilyInvite, InteractiveScreen, RecurringTransaction, Transaction, TransactionDraft, Transfer, User
@@ -687,8 +688,8 @@ async def split_command(message: Message, bot: Bot) -> None:
     user = await ensure_user(message)
     if not user.family_id:
         await rich.send(bot, message.chat.id, "<p>Сначала выполните /start.</p>"); return
-    action = f"<p>{link('adv:split', '＋ Разбить расход')}</p>" if can_manage_family(user) else "<p>Роль viewer может только просматривать данные.</p>"
-    await rich.send(bot, message.chat.id, "<h3>Разбить платёж</h3><p>Создаёт несколько связанных операций с разными категориями.</p>" + action)
+    action = f"<p>{link('inst:start', '＋ Покупка в рассрочку')}</p><p>{link('adv:split', 'Распределить по категориям')}</p>" if can_manage_family(user) else "<p>Роль viewer может только просматривать данные.</p>"
+    await rich.send(bot, message.chat.id, "<h3>Разбить платёж</h3><p>Рассрочка — равные ежемесячные платежи. Распределение по категориям — части одной покупки.</p>" + action)
 
 
 def split_summary_html(lines: list[dict[str, str]], currency: str) -> str:
@@ -2639,6 +2640,9 @@ async def advanced_value(message: Message, state: FSMContext, bot: Bot) -> None:
         return
     await state.clear()
     await rich.send(bot, message.chat.id, f"<p>{result}</p>")
+
+
+register_installments(router)
 
 
 @router.message(F.text & ~F.text.startswith("/"))
