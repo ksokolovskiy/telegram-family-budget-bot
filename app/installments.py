@@ -24,12 +24,12 @@ class InstallmentFlow(StatesGroup):
     review = State()
 
 
-def schedule(total, count, first):
+def schedule(total, count, first, *, allow_single=False):
     total = Decimal(total)
     if not total.is_finite() or total <= 0 or total != total.quantize(Decimal('.01')):
         raise ValueError('Сумма должна быть положительной, максимум два знака после запятой.')
-    if not 2 <= count <= 36:
-        raise ValueError('Количество платежей: от 2 до 36.')
+    if not (1 if allow_single else 2) <= count <= 36:
+        raise ValueError('Количество платежей вне допустимого диапазона.')
     cents = int(total * 100)
     base, remainder = divmod(cents, count)
     if not base:
@@ -108,8 +108,11 @@ async def action(callback, state, bot):
                         tx = await add_transaction(session, user.family_id, user.id, category, amount, 'expense', note)
                         tx.group_id = group.id
                         tx.date = datetime.combine(day, time(12), ZoneInfo(data['zone'])).astimezone(timezone.utc)
+                    group_id = group.id
+                else:
+                    group_id = existing.id
             await state.clear()
-            await ui.rich.edit(bot, callback.message.chat.id, callback.message.message_id, '<p>✓ Рассрочка записана. Каждый платёж учтён в своём месяце.</p>')
+            await ui.rich.edit(bot, callback.message.chat.id, callback.message.message_id, f'<p>✓ Рассрочка записана. Каждый платёж учтён в своём месяце.</p><p>{link(f"ip:{group_id}:view:0", "Расписание и управление")} · {link("ip:list:0", "Все рассрочки")}</p>')
             await ui.send_current_month_report(bot, callback.message.chat.id, user.id, user.family_id)
         else:
             await callback.answer('Это действие устарело. Откройте рассрочку заново.', show_alert=True)
@@ -186,6 +189,8 @@ async def category(callback, state, bot):
 
 
 def register(router):
+    from app.installment_management import register as register_management
+    register_management(router)
     router.callback_query.register(action, F.data.startswith('inst:'))
     router.callback_query.register(category, F.data.startswith('instcat:'))
     for stage in (InstallmentFlow.amount, InstallmentFlow.count, InstallmentFlow.first_date, InstallmentFlow.comment):

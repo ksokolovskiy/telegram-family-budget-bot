@@ -188,7 +188,7 @@ class RecurringEditFlow(StatesGroup):
 
 
 async def setup_commands(bot: Bot) -> None:
-    await bot.set_my_commands([BotCommand(command=name, description=description) for name, description in (("start", "Инициализация"), ("budget", "Лимиты"), ("report", "Отчет"), ("transactions", "Операции"), ("categories", "Категории"), ("recurring", "Регулярные операции"), ("split", "Разбить платёж"), ("family", "Семья и приглашения"), ("settings", "Настройки приложения"), ("help", "Помощь"))])
+    await bot.set_my_commands([BotCommand(command=name, description=description) for name, description in (("start", "Инициализация"), ("budget", "Лимиты"), ("report", "Отчет"), ("transactions", "Операции"), ("categories", "Категории"), ("recurring", "Регулярные операции"), ("split", "Разбить платёж"), ("installments", "Рассрочки и расписание"), ("family", "Семья и приглашения"), ("settings", "Настройки приложения"), ("help", "Помощь"))])
 
 
 async def ensure_user(message: Message) -> User:
@@ -688,7 +688,8 @@ async def split_command(message: Message, bot: Bot) -> None:
     user = await ensure_user(message)
     if not user.family_id:
         await rich.send(bot, message.chat.id, "<p>Сначала выполните /start.</p>"); return
-    action = f"<p>{link('inst:start', '＋ Покупка в рассрочку')}</p><p>{link('adv:split', 'Распределить по категориям')}</p>" if can_manage_family(user) else "<p>Роль viewer может только просматривать данные.</p>"
+    action = f"<p>{link('ip:list:0', 'Мои рассрочки и расписание')}</p>"
+    action += f"<p>{link('inst:start', '＋ Покупка в рассрочку')}</p><p>{link('adv:split', 'Распределить по категориям')}</p>" if can_manage_family(user) else "<p>Роль viewer может только просматривать данные.</p>"
     await rich.send(bot, message.chat.id, "<h3>Разбить платёж</h3><p>Рассрочка — равные ежемесячные платежи. Распределение по категориям — части одной покупки.</p>" + action)
 
 
